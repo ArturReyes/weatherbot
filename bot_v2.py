@@ -733,6 +733,22 @@ def in_bucket(forecast, t_low, t_high):
         return round(float(forecast)) == round(t_low)
     return t_low <= float(forecast) <= t_high
 
+def is_high_confidence_scalp(forecast, t_low, t_high, sigma, metar=None, unit="F"):
+    """True if forecast sits comfortably inside the bucket — no sigma slack to the edges."""
+    f = float(forecast)
+    if t_low == t_high:
+        if abs(f - t_low) >= 0.3:
+            return False
+    else:
+        margin = max(0.5 * sigma, 1.0)
+        if (f - t_low) < margin or (t_high - f) < margin:
+            return False
+    if metar is not None:
+        tol = 1.0 if unit == "F" else 0.6
+        if abs(float(metar) - f) > tol:
+            return False
+    return True
+
 # =============================================================================
 # MARKET DATA STORAGE
 # Each market is stored as: data/markets/{product}_{city}_{date}.json
@@ -835,14 +851,24 @@ def take_forecast_snapshot(city_slug, dates, product_kind=DEFAULT_PRODUCT_KIND):
         # Best forecast: HRRR for US D+0/D+1, otherwise ECMWF
         loc = LOCATIONS[city_slug]
         if loc["region"] == "us" and snap["hrrr"] is not None:
-            snap["best"] = snap["hrrr"]
-            snap["best_source"] = "hrrr"
+            model_value, model_src = snap["hrrr"], "hrrr"
         elif snap["ecmwf"] is not None:
-            snap["best"] = snap["ecmwf"]
-            snap["best_source"] = "ecmwf"
+            model_value, model_src = snap["ecmwf"], "ecmwf"
         else:
-            snap["best"] = None
-            snap["best_source"] = None
+            model_value, model_src = None, None
+
+        # METAR is an observation (not a prediction). For D+0 markets, treat it as
+        # a hard floor on max-temp markets and a hard ceiling on min-temp markets.
+        if date == today and snap["metar"] is not None and model_value is not None:
+            if product_kind == "max":
+                combined = max(float(snap["metar"]), float(model_value))
+            else:  # min
+                combined = min(float(snap["metar"]), float(model_value))
+            snap["best"] = combined
+            snap["best_source"] = f"{model_src}+metar" if combined != model_value else model_src
+        else:
+            snap["best"] = model_value
+            snap["best_source"] = model_src
         snapshots[date] = snap
     return snapshots
 
@@ -1201,6 +1227,82 @@ def scan_and_update():
                                 print(f"  [BUY]  {loc['name']} [{product_kind}] {horizon} {date} | {bucket_label} | "
                                       f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
                                       f"${best_signal['cost']:.2f} ({(best_signal['forecast_src'] or product_kind).upper()})")
+
+                    # --- SCALPING PATH: high-confidence late entries above MAX_PRICE ---
+                    has_open_now = mkt.get("position") and mkt["position"].get("status") == "open"
+                    if can_open and not has_open_now and forecast_temp is not None and 0 < hours <= 4.0 and matched_bucket:
+                        sigma_s = get_sigma(city_slug, best_source or "ecmwf", product_kind=product_kind)
+                        metar_value = snap.get("metar")
+                        if is_high_confidence_scalp(forecast_temp, *matched_bucket["range"], sigma_s, metar=metar_value, unit=unit):
+                            o_s = matched_bucket
+                            ask_s = o_s.get("ask", o_s["price"])
+                            spread_s = o_s.get("spread", 0)
+                            volume_s = o_s["volume"]
+                            if 0.85 <= ask_s <= 0.99 and spread_s <= MAX_SLIPPAGE and volume_s >= MIN_VOLUME:
+                                p_s = bucket_prob(forecast_temp, o_s["range"][0], o_s["range"][1], sigma_s)
+                                ev_s = calc_ev(p_s, ask_s)
+                                if ev_s > 0 and p_s > ask_s:
+                                    kelly_s = calc_kelly(p_s, ask_s)
+                                    size_s = bet_size(kelly_s, balance)
+                                    if size_s >= 0.50:
+                                        try:
+                                            _trace_scan(f"[SCALP] {loc['name']} [{product_kind}] {date}: refreshing {o_s['market_id']}")
+                                            mdata_s = get_gamma_json(
+                                                f"https://gamma-api.polymarket.com/markets/{o_s['market_id']}",
+                                                timeout=(3, 5),
+                                                label=f"SCALP {o_s['market_id']}",
+                                            )
+                                            real_ask_s = float(mdata_s.get("bestAsk", ask_s))
+                                            real_bid_s = float(mdata_s.get("bestBid", real_ask_s - spread_s))
+                                            real_spread_s = round(real_ask_s - real_bid_s, 4)
+                                            if real_ask_s > 0.99 or real_ask_s < 0.85 or real_spread_s > MAX_SLIPPAGE:
+                                                print(f"  [SCALP SKIP] {loc['name']} [{product_kind}] {date} — real ask ${real_ask_s:.3f} spread ${real_spread_s:.3f}")
+                                            else:
+                                                clob_ids_s = json.loads(mdata_s.get("clobTokenIds", "[]"))
+                                                token_id_s = clob_ids_s[0] if clob_ids_s else None
+                                                buy_ok = True
+                                                shares_s = round(size_s / real_ask_s, 2)
+                                                if LIVE_TRADING:
+                                                    result_s = place_live_buy(token_id_s, real_ask_s, size_s)
+                                                    if not result_s:
+                                                        buy_ok = False
+                                                    elif isinstance(result_s, (int, float)) and not isinstance(result_s, bool):
+                                                        shares_s = result_s
+                                                if buy_ok:
+                                                    balance -= size_s
+                                                    mkt["position"] = {
+                                                        "market_id":    o_s["market_id"],
+                                                        "question":     o_s["question"],
+                                                        "bucket_low":   o_s["range"][0],
+                                                        "bucket_high":  o_s["range"][1],
+                                                        "entry_price":  real_ask_s,
+                                                        "bid_at_entry": real_bid_s,
+                                                        "spread":       real_spread_s,
+                                                        "shares":       shares_s,
+                                                        "cost":         size_s,
+                                                        "p":            round(p_s, 4),
+                                                        "ev":           round(ev_s, 4),
+                                                        "kelly":        round(kelly_s, 4),
+                                                        "forecast_temp":forecast_temp,
+                                                        "forecast_src": best_source,
+                                                        "sigma":        sigma_s,
+                                                        "forecast_product": product_kind,
+                                                        "opened_at":    snap.get("ts"),
+                                                        "status":       "open",
+                                                        "strategy":     "scalp",
+                                                        "token_id":     token_id_s,
+                                                        "pnl":          None,
+                                                        "exit_price":   None,
+                                                        "close_reason": None,
+                                                        "closed_at":    None,
+                                                    }
+                                                    state["total_trades"] += 1
+                                                    new_pos += 1
+                                                    bucket_label_s = f"{int(o_s['range'][0])}-{int(o_s['range'][1])}{unit_sym}"
+                                                    print(f"  [SCALP] {loc['name']} [{product_kind}] {date} | {bucket_label_s} | "
+                                                          f"${real_ask_s:.3f} | EV {ev_s:+.2f} | ${size_s:.2f} | {hours:.1f}h left")
+                                        except Exception as e:
+                                            print(f"  [SCALP WARN] {o_s['market_id']}: {e}")
 
                     # Market closed by time
                     if hours < 0.5 and mkt["status"] == "open":
