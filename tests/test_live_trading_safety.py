@@ -343,6 +343,79 @@ class LiveTradingSafetyTests(unittest.TestCase):
         save_market.assert_called_once_with(market)
         save_state.assert_called_once_with({"balance": 10.0})
 
+    def test_monitor_positions_closes_on_wipeout_even_when_forecast_says_in_bucket(self):
+        """Wipeout branch: market price ≤ WIPEOUT_PRICE must override forecast_invalid=False
+        and close the position. This is the Munich/Tokyo/Seoul/London pattern."""
+        bot = _load_bot({})
+        market = {
+            "city": "seoul",
+            "date": "2026-05-03",
+            "event_end_date": "2026-05-03T15:00:00+00:00",
+            "forecast_snapshots": [{"best": 16.0}],  # forecast says 16 — IN bucket
+            "position": {
+                "status": "open",
+                "market_id": "market-1",
+                "entry_price": 0.26,
+                "stop_price": 0.24,
+                "bucket_low": 16,
+                "bucket_high": 16,
+                "shares": 5,
+                "cost": 1.30,
+            },
+        }
+
+        with (
+            patch.object(bot, "load_all_markets", return_value=[market]),
+            patch.object(bot, "load_state", return_value={"balance": 5.0}),
+            patch.object(bot, "get_gamma_json", return_value={"bestBid": "0.001"}),
+            patch.object(bot, "hours_to_resolution", return_value=2),
+            patch.object(bot, "save_market") as save_market,
+            patch.object(bot, "save_state"),
+        ):
+            self.assertEqual(bot.monitor_positions(), 1)
+
+        pos = market["position"]
+        self.assertEqual(pos["status"], "closed")
+        self.assertEqual(pos["close_reason"], "stop_loss")
+        self.assertAlmostEqual(pos["exit_price"], 0.001)
+        save_market.assert_called_once_with(market)
+
+    def test_monitor_positions_holds_on_temporary_dip_when_forecast_in_bucket(self):
+        """Negative case: price below stop but ABOVE WIPEOUT_PRICE, forecast still in bucket.
+        Should NOT close — this protects against false positives from spread/liquidity dips."""
+        bot = _load_bot({})
+        market = {
+            "city": "london",
+            "date": "2026-05-04",
+            "event_end_date": "2026-05-04T15:00:00+00:00",
+            "forecast_snapshots": [{"best": 19.0}],  # forecast IN bucket
+            "position": {
+                "status": "open",
+                "market_id": "market-1",
+                "entry_price": 0.30,
+                "stop_price": 0.24,
+                "bucket_low": 19,
+                "bucket_high": 19,
+                "shares": 5,
+                "cost": 1.50,
+            },
+        }
+
+        with (
+            patch.object(bot, "load_all_markets", return_value=[market]),
+            patch.object(bot, "load_state", return_value={"balance": 5.0}),
+            # 0.05 is below stop (0.24) but well above WIPEOUT_PRICE (0.01)
+            patch.object(bot, "get_gamma_json", return_value={"bestBid": "0.05"}),
+            patch.object(bot, "hours_to_resolution", return_value=2),
+            patch.object(bot, "save_market") as save_market,
+            patch.object(bot, "save_state") as save_state,
+        ):
+            self.assertEqual(bot.monitor_positions(), 0)
+
+        self.assertEqual(market["position"]["status"], "open")
+        save_market.assert_not_called()
+        save_state.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

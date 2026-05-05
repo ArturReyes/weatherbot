@@ -44,6 +44,7 @@ KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
+WIPEOUT_PRICE    = _cfg.get("wipeout_price", 0.01)  # market price at/below this = market has resolved against us; close regardless of forecast
 VC_KEY           = _cfg.get("vc_key", "")
 
 # Live trading credentials are loaded from environment variables only.
@@ -1000,10 +1001,12 @@ def scan_and_update():
                                 pos["stop_price"] = entry
                                 pos["trailing_activated"] = True
 
-                            # Check stop
-                            # Stop is conditional on forecast: only close if price hit stop AND forecast is out of bucket
+                            # Check stop — fire if price ≤ stop AND (forecast says out-of-bucket OR market has wiped out the position).
+                            # The wipeout branch overrides the forecast: a near-zero price means the market resolved the
+                            # question regardless of what ECMWF still predicts.
                             forecast_invalid = forecast_temp is None or not in_bucket(forecast_temp, pos["bucket_low"], pos["bucket_high"])
-                            if current_price <= stop and forecast_invalid:
+                            wipeout_triggered = current_price <= WIPEOUT_PRICE
+                            if current_price <= stop and (forecast_invalid or wipeout_triggered):
                                 live_sell_ok = True
                                 actual_shares = pos["shares"]
                                 actual_price = current_price
@@ -1498,11 +1501,14 @@ def monitor_positions():
 
         # Check take-profit
         take_triggered = take_profit is not None and current_price >= take_profit
-        # Check stop — only if forecast also says we're out of bucket
+        # Check stop — fire if price ≤ stop AND (forecast says out-of-bucket OR market has wiped out the position).
+        # The wipeout branch overrides the forecast: a near-zero price means the market resolved the
+        # question regardless of what ECMWF still predicts (see Munich/Tokyo/Seoul/London wipeouts).
         snaps = mkt.get("forecast_snapshots", [])
         latest_forecast = snaps[-1].get("best") if snaps else None
         forecast_invalid = latest_forecast is None or not in_bucket(latest_forecast, pos["bucket_low"], pos["bucket_high"])
-        stop_triggered = current_price <= stop and forecast_invalid
+        wipeout_triggered = current_price <= WIPEOUT_PRICE
+        stop_triggered = current_price <= stop and (forecast_invalid or wipeout_triggered)
 
         if take_triggered or stop_triggered:
             live_sell_ok = True
