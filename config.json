@@ -9,5 +9,15 @@
   "kelly_fraction": 0.25,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "max_slippage": 0.03
+  "max_slippage": 0.03,
+  "max_total_exposure_pct": 0.25,
+  "max_event_exposure_pct": 0.1,
+  "max_daily_loss_pct": 0.05,
+  "max_open_positions": 5,
+  "max_signal_age_seconds": 120,
+  "forecast_cache_ttl_ecmwf_seconds": 1800,
+  "forecast_cache_ttl_hrrr_seconds": 600,
+  "forecast_cache_ttl_metar_seconds": 45,
+  "max_bias_correction_f": 3.0,
+  "max_bias_correction_c": 1.5
 }

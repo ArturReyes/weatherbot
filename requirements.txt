@@ -1,5 +1,4 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
 # Polymarket CLOB SDK (beta) — for live trading with live_executor.py
-# pip install --pre polymarket-client
-# polymarket-client>=0.4.0b0
+polymarket-client==0.1.0b8

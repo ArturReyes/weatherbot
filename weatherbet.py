@@ -24,6 +24,17 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from calibration import (
+    LEAD_TIME_BUCKETS,
+    bias_adjusted_forecast,
+    calibration_errors,
+    decaying_mean_error,
+    lead_time_bucket,
+    rmse_sigma,
+)
+from paper_trading import close_position, revalidate_signal, yes_quote
+from trading_risk import fee_adjusted_ev, fee_adjusted_kelly, market_fee_rate
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -44,6 +55,10 @@ KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 15)
+BIAS_DECAY = float(_cfg.get("bias_decay", 0.97))
+BIAS_PRIOR_STRENGTH = float(_cfg.get("bias_prior_strength", 20.0))
+MAX_BIAS_CORRECTION_F = float(_cfg.get("max_bias_correction_f", 3.0))
+MAX_BIAS_CORRECTION_C = float(_cfg.get("max_bias_correction_c", 1.5))
 # VC_KEY: fetch from env var first, fall back to config.json
 VC_KEY           = os.environ.get("VC_KEY") or _cfg.get("vc_key", "")
 
@@ -125,15 +140,16 @@ def bucket_prob(forecast, t_low, t_high, sigma=None):
     z_high = (t_high - float(forecast)) / s
     return norm_cdf(z_high) - norm_cdf(z_low)
 
-def calc_ev(p, price):
-    if price <= 0 or price >= 1: return 0.0
-    return round(p * (1.0 / price - 1.0) - (1.0 - p), 4)
+def calc_ev(p, price, fee_rate=0.0):
+    return fee_adjusted_ev(probability=p, price=price, fee_rate=fee_rate)
 
-def calc_kelly(p, price):
-    if price <= 0 or price >= 1: return 0.0
-    b = 1.0 / price - 1.0
-    f = (p * b - (1.0 - p)) / b
-    return round(min(max(0.0, f) * KELLY_FRACTION, 1.0), 4)
+def calc_kelly(p, price, fee_rate=0.0):
+    full_kelly = fee_adjusted_kelly(
+        probability=p,
+        price=price,
+        fee_rate=fee_rate,
+    )
+    return round(min(full_kelly * KELLY_FRACTION, 1.0), 4)
 
 def bet_size(kelly, balance):
     raw = kelly * balance
@@ -145,43 +161,108 @@ def bet_size(kelly, balance):
 
 _cal: dict = {}
 
+def install_calibration(cal):
+    global _cal
+    _cal = cal
+    return _cal
+
 def load_cal():
     if CALIBRATION_FILE.exists():
-        return json.loads(CALIBRATION_FILE.read_text(encoding="utf-8"))
-    return {}
+        return install_calibration(json.loads(CALIBRATION_FILE.read_text(encoding="utf-8")))
+    return install_calibration({})
 
-def get_sigma(city_slug, source="ecmwf"):
+def get_sigma(city_slug, source="ecmwf", lead_bucket=None):
+    if lead_bucket:
+        key = f"{city_slug}_{source}_{lead_bucket}"
+        if key in _cal:
+            return _cal[key]["sigma"]
     key = f"{city_slug}_{source}"
     if key in _cal:
         return _cal[key]["sigma"]
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
+def _max_bias_correction(city_slug):
+    return MAX_BIAS_CORRECTION_F if LOCATIONS[city_slug]["unit"] == "F" else MAX_BIAS_CORRECTION_C
+
+def forecast_calibration(city_slug, source, raw_forecast, snapshot_ts, event_end_ts):
+    """Return calibrated forecast metadata without fetching or trading."""
+    source = source or "ecmwf"
+    lead_bucket = lead_time_bucket(snapshot_ts, event_end_ts)
+    entry = {}
+    if lead_bucket:
+        entry = _cal.get(f"{city_slug}_{source}_{lead_bucket}", {})
+
+    bias = float(entry.get("bias", 0.0))
+    raw_bias = float(entry.get("raw_bias", bias))
+    corrected = bias_adjusted_forecast(
+        float(raw_forecast),
+        bias,
+        max_correction=_max_bias_correction(city_slug),
+    )
+    applied_bias = float(raw_forecast) - corrected
+    return {
+        "raw_forecast_temp": float(raw_forecast),
+        "corrected_forecast_temp": corrected,
+        "forecast_temp": corrected,
+        "forecast_bias": applied_bias,
+        "forecast_raw_bias": raw_bias,
+        "forecast_lead_bucket": lead_bucket,
+        "forecast_calibration_n": int(entry.get("n", 0)),
+        "sigma": get_sigma(city_slug, source, lead_bucket),
+    }
+
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets."""
+    """Recalculates aggregate sigma and lead-bucket bias/sigma calibration."""
     resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
     cal = load_cal()
     updated = []
+    updated_at = datetime.now(timezone.utc).isoformat()
+    lead_buckets = [label for _, _, label in LEAD_TIME_BUCKETS] + ["72h_plus"]
 
     for source in ["ecmwf", "hrrr", "metar"]:
         for city in set(m["city"] for m in resolved):
-            group = [m for m in resolved if m["city"] == city]
-            errors = []
-            for m in group:
-                snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s.get(source) is not None), None)
-                if snap and snap.get(source) is not None:
-                    errors.append(abs(snap[source] - m["actual_temp"]))
+            errors = calibration_errors(resolved, city=city, source=source)
             if len(errors) < CALIBRATION_MIN:
                 continue
-            mae  = sum(errors) / len(errors)
             key  = f"{city}_{source}"
             old  = cal.get(key, {}).get("sigma", SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C)
-            new  = round(mae, 3)
-            cal[key] = {"sigma": new, "n": len(errors), "updated_at": datetime.now(timezone.utc).isoformat()}
+            floor = 0.5 if LOCATIONS[city]["unit"] == "F" else 0.25
+            new  = round(rmse_sigma(errors, floor=floor), 3)
+            cal[key] = {"sigma": new, "n": len(errors), "updated_at": updated_at}
             if abs(new - old) > 0.05:
                 updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
 
+            for lead_bucket in lead_buckets:
+                bucket_errors = calibration_errors(
+                    resolved,
+                    city=city,
+                    source=source,
+                    lead_bucket=lead_bucket,
+                )
+                if len(bucket_errors) < CALIBRATION_MIN:
+                    continue
+                estimate = decaying_mean_error(
+                    resolved,
+                    city=city,
+                    source=source,
+                    lead_bucket=lead_bucket,
+                    decay=BIAS_DECAY,
+                    prior_strength=BIAS_PRIOR_STRENGTH,
+                )
+                bucket_key = f"{city}_{source}_{lead_bucket}"
+                cal[bucket_key] = {
+                    "city": city,
+                    "source": source,
+                    "lead_bucket": lead_bucket,
+                    "bias": round(estimate.bias, 3),
+                    "raw_bias": round(estimate.raw_bias, 3),
+                    "sigma": round(rmse_sigma(bucket_errors, floor=floor), 3),
+                    "n": len(bucket_errors),
+                    "updated_at": updated_at,
+                }
+
     _atomic_write_text(CALIBRATION_FILE, json.dumps(cal, indent=2))
+    install_calibration(cal)
     if updated:
         print(f"  [CAL] {', '.join(updated)}")
     return cal
@@ -536,10 +617,11 @@ def scan_and_update():
                 if not rng:
                     continue
                 try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
-                    bid = float(prices[0])
-                    ask = float(prices[1]) if len(prices) > 1 else bid
-                except Exception:
+                    quote = yes_quote(market)
+                    bid = quote.bid
+                    ask = quote.ask
+                    fee_rate = market_fee_rate(market)
+                except (TypeError, ValueError, json.JSONDecodeError):
                     continue
                 outcomes.append({
                     "question":  question,
@@ -550,6 +632,7 @@ def scan_and_update():
                     "price":     round(bid, 4),   # for compatibility
                     "spread":    round(ask - bid, 4),
                     "volume":    round(volume, 0),
+                    "fee_rate":  fee_rate,
                 })
 
             outcomes.sort(key=lambda x: x["range"][0])
@@ -557,6 +640,19 @@ def scan_and_update():
 
             # Forecast snapshot
             snap = snapshots.get(date, {})
+            raw_forecast_temp = snap.get("best")
+            best_source = snap.get("best_source")
+            forecast_meta = {}
+            forecast_temp = raw_forecast_temp
+            if raw_forecast_temp is not None and best_source is not None:
+                forecast_meta = forecast_calibration(
+                    city_slug,
+                    best_source,
+                    raw_forecast_temp,
+                    snap.get("ts"),
+                    end_date,
+                )
+                forecast_temp = forecast_meta["corrected_forecast_temp"]
             forecast_snap = {
                 "ts":          snap.get("ts"),
                 "horizon":     horizon,
@@ -565,6 +661,12 @@ def scan_and_update():
                 "hrrr":        snap.get("hrrr"),
                 "metar":       snap.get("metar"),
                 "best":        snap.get("best"),
+                "raw_forecast_temp": raw_forecast_temp,
+                "corrected_forecast_temp": forecast_temp,
+                "forecast_bias": forecast_meta.get("forecast_bias", 0.0),
+                "forecast_raw_bias": forecast_meta.get("forecast_raw_bias", 0.0),
+                "forecast_lead_bucket": forecast_meta.get("forecast_lead_bucket"),
+                "forecast_calibration_n": forecast_meta.get("forecast_calibration_n", 0),
                 "best_source": snap.get("best_source"),
             }
             mkt["forecast_snapshots"].append(forecast_snap)
@@ -577,9 +679,6 @@ def scan_and_update():
                 "top_price":  top["price"] if top else None,
             }
             mkt["market_snapshots"].append(market_snap)
-
-            forecast_temp = snap.get("best")
-            best_source   = snap.get("best_source")
 
             # --- STOP-LOSS AND TRAILING STOP ---
             if mkt.get("position") and mkt["position"].get("status") == "open":
@@ -602,19 +701,23 @@ def scan_and_update():
 
                     # Check stop
                     if current_price <= stop:
-                        pnl = round((current_price - entry) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
-                        pos["closed_at"]    = snap.get("ts")
-                        pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
-                        pos["exit_price"]   = current_price
-                        pos["pnl"]          = pnl
-                        pos["status"]       = "closed"
-                        closed += 1
-                        reason = "STOP" if current_price < entry else "TRAILING BE"
-                        print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                        balance, did_close = close_position(
+                            pos,
+                            balance=balance,
+                            current_price=current_price,
+                            reason="stop_loss" if current_price < entry else "trailing_stop",
+                            closed_at=snap.get("ts"),
+                        )
+                        if did_close:
+                            closed += 1
+                            reason = "STOP" if current_price < entry else "TRAILING BE"
+                            pnl = pos["pnl"]
+                            print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
             # --- CLOSE POSITION if forecast shifted 2+ degrees ---
-            if mkt.get("position") and forecast_temp is not None:
+            if (mkt.get("position")
+                    and mkt["position"].get("status") == "open"
+                    and forecast_temp is not None):
                 pos = mkt["position"]
                 old_bucket_low  = pos["bucket_low"]
                 old_bucket_high = pos["bucket_high"]
@@ -630,19 +733,21 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
-                        pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
-                        mkt["position"]["closed_at"]    = snap.get("ts")
-                        mkt["position"]["close_reason"] = "forecast_changed"
-                        mkt["position"]["exit_price"]   = current_price
-                        mkt["position"]["pnl"]          = pnl
-                        mkt["position"]["status"]       = "closed"
-                        closed += 1
-                        print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                        balance, did_close = close_position(
+                            pos,
+                            balance=balance,
+                            current_price=current_price,
+                            reason="forecast_changed",
+                            closed_at=snap.get("ts"),
+                        )
+                        if did_close:
+                            closed += 1
+                            pnl = pos["pnl"]
+                            print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
             # --- OPEN POSITION ---
             if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
-                sigma = get_sigma(city_slug, best_source or "ecmwf")
+                sigma = float(forecast_meta.get("sigma", get_sigma(city_slug, best_source or "ecmwf")))
                 best_signal = None
 
                 # Find exactly ONE bucket that matches the forecast
@@ -661,15 +766,19 @@ def scan_and_update():
                     bid    = o.get("bid", o["price"])
                     ask    = o.get("ask", o["price"])
                     spread = o.get("spread", 0)
+                    fee_rate = o.get("fee_rate", 0.0)
 
                     # All filters — if any fails, skip this market entirely
                     if volume >= MIN_VOLUME:
+                        raw_p = bucket_prob(raw_forecast_temp, t_low, t_high, sigma)
                         p  = bucket_prob(forecast_temp, t_low, t_high, sigma)
-                        ev = calc_ev(p, ask)
+                        raw_ev = calc_ev(raw_p, ask, fee_rate)
+                        ev = calc_ev(p, ask, fee_rate)
                         if ev >= MIN_EV:
-                            kelly = calc_kelly(p, ask)
+                            kelly = calc_kelly(p, ask, fee_rate)
                             size  = bet_size(kelly, balance)
                             if size >= 0.50:
+                                total_cost_per_share = ask + fee_rate * ask * (1.0 - ask)
                                 best_signal = {
                                     "market_id":    o["market_id"],
                                     "question":     o["question"],
@@ -678,12 +787,21 @@ def scan_and_update():
                                     "entry_price":  ask,
                                     "bid_at_entry": bid,
                                     "spread":       spread,
-                                    "shares":       round(size / ask, 2),
+                                    "shares":       round(size / total_cost_per_share, 2),
                                     "cost":         size,
+                                    "fee_rate":     fee_rate,
                                     "p":            round(p, 4),
+                                    "raw_p":        round(raw_p, 4),
                                     "ev":           round(ev, 4),
+                                    "raw_ev":       round(raw_ev, 4),
                                     "kelly":        round(kelly, 4),
                                     "forecast_temp":forecast_temp,
+                                    "raw_forecast_temp": raw_forecast_temp,
+                                    "corrected_forecast_temp": forecast_temp,
+                                    "forecast_bias": forecast_meta.get("forecast_bias", 0.0),
+                                    "forecast_raw_bias": forecast_meta.get("forecast_raw_bias", 0.0),
+                                    "forecast_lead_bucket": forecast_meta.get("forecast_lead_bucket"),
+                                    "forecast_calibration_n": forecast_meta.get("forecast_calibration_n", 0),
                                     "forecast_src": best_source,
                                     "sigma":        sigma,
                                     "opened_at":    snap.get("ts"),
@@ -700,21 +818,22 @@ def scan_and_update():
                     try:
                         r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
                         mdata = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["bid_at_entry"]))
-                        real_spread = round(real_ask - real_bid, 4)
-                        # Re-check slippage and price with real values
-                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
-                            print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
+                        refreshed = revalidate_signal(
+                            best_signal,
+                            mdata,
+                            min_ev=MIN_EV,
+                            max_price=MAX_PRICE,
+                            max_spread=MAX_SLIPPAGE,
+                        )
+                        if refreshed is None:
+                            quote = yes_quote(mdata)
+                            print(f"  [SKIP] {loc['name']} {date} — refreshed ask ${quote.ask:.3f} spread ${quote.ask - quote.bid:.3f} or EV below minimum")
                             skip_position = True
                         else:
-                            best_signal["entry_price"]  = real_ask
-                            best_signal["bid_at_entry"] = real_bid
-                            best_signal["spread"]       = real_spread
-                            best_signal["shares"]       = round(best_signal["cost"] / real_ask, 2)
-                            best_signal["ev"]           = round(calc_ev(best_signal["p"], real_ask), 4)
+                            best_signal = refreshed
                     except Exception as e:
                         print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                        skip_position = True
 
                     if not skip_position and best_signal["entry_price"] < MAX_PRICE:
                         balance -= best_signal["cost"]
