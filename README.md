@@ -2,7 +2,7 @@
 
 Automated weather market trading bot for Polymarket. Finds mispriced temperature outcomes using real forecast data from multiple sources across 20 cities worldwide.
 
-No SDK. No black box. Pure Python.
+Paper trading is handled by `weatherbet.py`. Live order execution is handled separately by `live_executor.py`.
 
 ---
 
@@ -21,13 +21,16 @@ Everything in v1, plus:
 - **Kelly Criterion** — sizes positions based on edge strength
 - **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
 - **Slippage filter** — skips markets with spread > $0.03
-- **Self-calibration** — learns forecast accuracy per city over time
+- **Self-calibration** — learns sigma and bias by city/source/lead-time bucket
+- **Bias correction** — applies capped forecast corrections before probability calculation
 - **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
 
 ### `live_executor.py` — Live Trading
-Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via the official SDK. Full live trading loop with:
-- `SecureClient.buy()` / `sell()` order placement
+Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via `polymarket-client`. Full live trading loop with:
+- FAK market-order entry/exit through the SDK
 - On-chain USDC balance checks
+- Fresh market revalidation before order submission
+- Portfolio risk gates and exposure limits
 - Stop-loss, take-profit, trailing stop exits
 - Circuit breaker (stops after 5 consecutive errors)
 - Telegram notifications
@@ -42,11 +45,12 @@ Polymarket runs markets like "Will the highest temperature in Chicago be between
 The bot:
 1. Fetches forecasts from ECMWF and HRRR via Open-Meteo (free, no key required)
 2. Gets real-time observations from METAR airport stations
-3. Finds the matching temperature bucket on Polymarket
-4. Calculates Expected Value — only enters if the math is positive
-5. Sizes the position using fractional Kelly Criterion
-6. Monitors stops every 10 minutes, full scan every hour
-7. Auto-resolves markets by querying Polymarket API directly
+3. Applies city/source/lead-time calibration and capped bias correction
+4. Finds the matching temperature bucket on Polymarket
+5. Calculates fee-adjusted Expected Value — only enters if the math is positive
+6. Sizes the position using fractional Kelly Criterion
+7. Monitors stops every 10 minutes, full scan every hour
+8. Auto-resolves markets by querying Polymarket API directly
 
 ---
 
@@ -88,26 +92,48 @@ cp .env.example .env
 
 ---
 
-## Usage
+## Usage and Safe Progression
 
-### Paper trade (strategy simulation):
+### 1. Paper trade first
+
+This is the safe starting mode. It writes simulated positions and calibration data under `data/`.
 
 ```bash
-python weatherbet.py           # start the bot — scans every hour
+python weatherbet.py run       # start paper trading loop
 python weatherbet.py status    # balance and open positions
 python weatherbet.py report    # full breakdown of all resolved markets
 ```
 
-### Live trade:
+You can also run `python weatherbet.py` with no argument; it defaults to `run`.
+
+### 2. Live account status only
+
+This connects to the exchange and reads account/position state. It should not place orders.
 
 ```bash
-python live_executor.py                # run the live trading loop
-python live_executor.py status         # show balance + positions
-python live_executor.py cancel         # cancel all open CLOB orders
-python live_executor.py scan           # run one scan cycle, then exit
+python live_executor.py status
 ```
 
-> Paper-trade first to let calibration data accumulate in `data/` — `live_executor.py` reuses it for sigma calibration.
+### 3. Live trading commands
+
+These commands can change real exchange state.
+
+```bash
+python live_executor.py run            # live trading loop; can place and exit orders
+python live_executor.py                # same as run
+python live_executor.py scan           # one live scan cycle; can place orders
+python live_executor.py cancel         # cancels all open CLOB orders
+```
+
+Important: `live_executor.py scan` is not a dry run. If your `.env` has a valid funded `PK`, it can submit live FAK orders.
+
+Recommended order:
+
+1. Run `weatherbet.py run` in paper mode.
+2. Review `weatherbet.py status` and `weatherbet.py report`.
+3. Confirm calibration files are accumulating in `data/`.
+4. Add a true no-order dry-run mode before using live execution for signal testing.
+5. Only then use `live_executor.py run` or `live_executor.py scan` with real funds.
 
 ---
 
@@ -115,7 +141,7 @@ python live_executor.py scan           # run one scan cycle, then exit
 
 | Key | Required? | Where to get it |
 |-----|-----------|-----------------|
-| `PK` | **Yes** | Your MetaMask / wallet's Polygon private key (see below) |
+| `PK` | Only for live trading | Your MetaMask / wallet's Polygon private key (see below) |
 | `VC_KEY` | No | https://www.visualcrossing.com/weather-api (free) |
 | `TELEGRAM_BOT_TOKEN` | No | https://t.me/BotFather |
 | `TELEGRAM_CHAT_ID` | No | Get from Telegram API (see below) |
@@ -168,8 +194,10 @@ Only needed if you want the bot to fetch actual historical temperatures after ma
 
 ## Configure `.env`
 
+Paper trading does not require a private key. Live trading does.
+
 ```env
-# === REQUIRED ===
+# === REQUIRED FOR LIVE TRADING ONLY ===
 PK=0xabc123def456...your_private_key_here
 
 # === OPTIONAL ===
@@ -192,6 +220,17 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 | `max_slippage` | 0.03 | Max allowed ask-bid spread |
 | `kelly_fraction` | 0.25 | Fraction of Kelly to bet (0.25 = quarter-Kelly) |
 | `scan_interval` | 3600 | Seconds between full market scans |
+| `calibration_min` | 30 | Minimum resolved samples before writing calibration |
+| `max_total_exposure_pct` | 0.25 | Max total portfolio exposure as share of bankroll |
+| `max_event_exposure_pct` | 0.10 | Max same city/date exposure as share of bankroll |
+| `max_daily_loss_pct` | 0.05 | Stops new entries after daily realized loss breach |
+| `max_open_positions` | 5 | Max active positions |
+| `max_signal_age_seconds` | 120 | Rejects stale signals before live order submission |
+| `forecast_cache_ttl_ecmwf_seconds` | 1800 | ECMWF forecast cache TTL |
+| `forecast_cache_ttl_hrrr_seconds` | 600 | HRRR forecast cache TTL |
+| `forecast_cache_ttl_metar_seconds` | 45 | METAR observation cache TTL |
+| `max_bias_correction_f` | 3.0 | Max forecast bias correction in °F |
+| `max_bias_correction_c` | 1.5 | Max forecast bias correction in °C |
 
 ---
 
@@ -202,23 +241,27 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 pip install -r requirements.txt
 pip install --pre polymarket-client
 
-# 2. Set up secrets
+# 2. Set up environment file
 cp .env.example .env
-# ... edit .env with PK and optional keys ...
+# For paper trading, VC_KEY is optional and PK can stay empty.
+# For live trading, set PK and optional WALLET/Telegram values.
 
 # 3. Verify imports
 python -c "from weatherbet import bucket_prob; print('weatherbet OK')"
-python -c "from live_executor import LiveExecutor; print('live_executor OK')"
 
-# 4. Paper trade for a few days (collect calibration data)
+# 4. Paper trade for several days and collect calibration data
+python weatherbet.py run
 python weatherbet.py status
+python weatherbet.py report
 
-# 5. Dry-run live (scans + prints signals, attempts orders)
-python live_executor.py scan
+# 5. Only after paper validation, verify live account state
+python live_executor.py status
 
-# 6. Go live
+# 6. Go live with small limits first
 python live_executor.py
 ```
+
+Do not use `python live_executor.py scan` as a dry run. It can place orders.
 
 ---
 
@@ -227,10 +270,10 @@ python live_executor.py
 All data is saved to `data/markets/` — one JSON file per market. Each file contains:
 - Hourly forecast snapshots (ECMWF, HRRR, METAR)
 - Market price history
-- Position details (entry, stop, PnL)
+- Position details (entry, stop, PnL, raw/corrected forecast, bias, raw/corrected EV)
 - Final resolution outcome
 
-This data is used for self-calibration — the bot learns forecast accuracy per city over time and adjusts position sizing accordingly.
+Calibration is saved to `data/calibration.json`. The bot writes aggregate sigma entries and city/source/lead-bucket entries containing bias, raw bias, sigma, and sample count. Live signal generation uses the corrected forecast before probability calculation.
 
 ---
 
