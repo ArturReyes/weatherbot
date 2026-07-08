@@ -6,19 +6,6 @@ No SDK. No black box. Pure Python.
 
 ---
 
-## Setup
-
-Install dependencies (includes `requests` and `py-clob-client` for Polymarket CLOB):
-
-```bash
-cd /path/to/weatherbot
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
----
-
 ## Versions
 
 ### `bot_v1.py` — Base Bot
@@ -36,6 +23,15 @@ Everything in v1, plus:
 - **Slippage filter** — skips markets with spread > $0.03
 - **Self-calibration** — learns forecast accuracy per city over time
 - **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
+
+### `live_executor.py` — Live Trading
+Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via the official SDK. Full live trading loop with:
+- `SecureClient.buy()` / `sell()` order placement
+- On-chain USDC balance checks
+- Stop-loss, take-profit, trailing stop exits
+- Circuit breaker (stops after 5 consecutive errors)
+- Telegram notifications
+- Atomic state file writes (no corruption on crash)
 
 ---
 
@@ -75,68 +71,153 @@ Every Polymarket weather market resolves on a specific airport station. NYC reso
 ---
 
 ## Installation
+
 ```bash
 git clone https://github.com/alteregoeth-ai/weatherbot
 cd weatherbot
-pip install requests
+pip install -r requirements.txt
+
+# For live trading (optional — only if using live_executor.py):
+pip install --pre polymarket-client
+
+# Copy and edit your secrets:
+cp .env.example .env
 ```
 
-Create `config.json` in the project folder:
-```json
-{
-  "balance": 10000.0,
-  "max_bet": 20.0,
-  "min_ev": 0.05,
-  "max_price": 0.45,
-  "min_volume": 2000,
-  "min_hours": 2.0,
-  "max_hours": 72.0,
-  "kelly_fraction": 0.25,
-  "max_slippage": 0.03,
-  "scan_interval": 3600,
-  "calibration_min": 30,
-  "vc_key": "YOUR_VISUAL_CROSSING_KEY"
-}
-```
-
-Get a free Visual Crossing API key at visualcrossing.com — used to fetch actual temperatures after market resolution.
-
-### Live Trading Secrets (secure local setup)
-
-Live credentials should be stored in macOS Keychain and loaded into environment variables at runtime.
-Do not put private keys or API secrets in `config.json`, code, commits, or terminal history.
-
-```bash
-chmod 700 scripts/setup_live_secrets.sh scripts/load_live_env.sh
-./scripts/setup_live_secrets.sh
-source ./scripts/load_live_env.sh
-```
-
-Environment variables used by the bot:
-- `PRIVATE_KEY`
-- `CHAIN_ID`
-- `SIGNATURE_TYPE`
-- `PROXY_KEY`
-- `POLY_API_KEY`
-- `POLY_SECRET`
-- `POLY_PASSPHRASE`
-
-If the integrated terminal closes with **exit code 1** right after `source ./scripts/load_live_env.sh`, that was almost always a **Keychain read failure** combined with strict `set -e` in older versions of the loader. The script is now safe to source: failed lookups leave variables empty and print hints instead of exiting your shell. Confirm readiness with:
-
-```bash
-source ./scripts/load_live_env.sh
-python weatherbet.py livecheck
-```
+> `.env` is in `.gitignore` — your secrets stay local. Never commit `.env`.
 
 ---
 
 ## Usage
+
+### Paper trade (strategy simulation):
+
 ```bash
-python weatherbet.py           # start the bot — scans every hour (or: python weatherbot.py / python bot_v2.py)
+python weatherbet.py           # start the bot — scans every hour
 python weatherbet.py status    # balance and open positions
 python weatherbet.py report    # full breakdown of all resolved markets
-python weatherbet.py wallet    # live on-chain wallet balances (Polygon)
-python weatherbet.py livecheck # verify live env + CLOB client without placing orders
+```
+
+### Live trade:
+
+```bash
+python live_executor.py                # run the live trading loop
+python live_executor.py status         # show balance + positions
+python live_executor.py cancel         # cancel all open CLOB orders
+python live_executor.py scan           # run one scan cycle, then exit
+```
+
+> Paper-trade first to let calibration data accumulate in `data/` — `live_executor.py` reuses it for sigma calibration.
+
+---
+
+## What API Keys Do You Need?
+
+| Key | Required? | Where to get it |
+|-----|-----------|-----------------|
+| `PK` | **Yes** | Your MetaMask / wallet's Polygon private key (see below) |
+| `VC_KEY` | No | https://www.visualcrossing.com/weather-api (free) |
+| `TELEGRAM_BOT_TOKEN` | No | https://t.me/BotFather |
+| `TELEGRAM_CHAT_ID` | No | Get from Telegram API (see below) |
+
+### 1. `PK` — Polymarket Wallet Private Key
+
+This is your Polygon EOA private key. The bot signs orders with it.
+
+**If you have MetaMask:**
+
+```
+MetaMask → three dots → Account details → Show private key → copy 0x...
+```
+
+**If you don't have a wallet yet:**
+
+1. Install MetaMask: https://metamask.io
+2. Create a new wallet — save the seed phrase
+3. Add Polygon network:
+   - Network Name: Polygon
+   - RPC URL: https://polygon-rpc.com
+   - Chain ID: 137
+4. Fund it: buy USDC.e on Polygon or bridge via https://wallet.polygon.technology/
+5. Export private key from MetaMask as above
+
+> ⚠️ This key controls your funds. Never share it, never commit it, never type it where anyone can see.
+
+### 2. `VC_KEY` — Visual Crossing (for calibration)
+
+Only needed if you want the bot to fetch actual historical temperatures after markets resolve (for per-city sigma calibration).
+
+```bash
+# 1. Sign up: https://www.visualcrossing.com/weather-api
+# 2. Free tier: 1,000 queries/day
+# 3. Dashboard → API Keys → copy
+```
+
+> Without this, the bot uses default sigma values (2°F / 1.2°C). It still works — calibration just won't adapt to each city's forecast accuracy.
+
+### 3. Telegram (for push notifications)
+
+```bash
+# Talk to @BotFather: /newbot → name it → copy the bot token
+# Send any message to your new bot
+# Visit: https://api.telegram.org/bot<TOKEN>/getUpdates
+# Copy the "chat": { "id": 123456789 }
+```
+
+---
+
+## Configure `.env`
+
+```env
+# === REQUIRED ===
+PK=0xabc123def456...your_private_key_here
+
+# === OPTIONAL ===
+WALLET=0x...            # wallet address (derived from PK if omitted)
+VC_KEY=your_key_here    # Visual Crossing (calibration)
+TELEGRAM_BOT_TOKEN=     # for notifications
+TELEGRAM_CHAT_ID=       # your Telegram user/group ID
+```
+
+---
+
+## Strategy Parameters (`config.json`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `balance` | 10000 | Starting balance for Kelly sizing |
+| `max_bet` | 20 | Max bet per trade in USDC |
+| `min_ev` | 0.10 | Minimum expected value required |
+| `max_price` | 0.45 | Max entry price (avoid expensive YES shares) |
+| `max_slippage` | 0.03 | Max allowed ask-bid spread |
+| `kelly_fraction` | 0.25 | Fraction of Kelly to bet (0.25 = quarter-Kelly) |
+| `scan_interval` | 3600 | Seconds between full market scans |
+
+---
+
+## Pre-Flight Checklist
+
+```bash
+# 1. Install everything
+pip install -r requirements.txt
+pip install --pre polymarket-client
+
+# 2. Set up secrets
+cp .env.example .env
+# ... edit .env with PK and optional keys ...
+
+# 3. Verify imports
+python -c "from weatherbet import bucket_prob; print('weatherbet OK')"
+python -c "from live_executor import LiveExecutor; print('live_executor OK')"
+
+# 4. Paper trade for a few days (collect calibration data)
+python weatherbet.py status
+
+# 5. Dry-run live (scans + prints signals, attempts orders)
+python live_executor.py scan
+
+# 6. Go live
+python live_executor.py
 ```
 
 ---
@@ -160,7 +241,18 @@ This data is used for self-calibration — the bot learns forecast accuracy per 
 | Open-Meteo | None | ECMWF + HRRR forecasts |
 | Aviation Weather (METAR) | None | Real-time station observations |
 | Polymarket Gamma | None | Market data |
-| Visual Crossing | Free key | Historical temps for resolution |
+| Polymarket CLOB | Wallet signature | Order placement (live trading only) |
+| Visual Crossing | Free key | Historical temps for calibration |
+
+---
+
+## Security Notes
+
+- All secrets go through `.env` only — never hardcoded in source files
+- `.env` is in `.gitignore` — cannot be accidentally committed
+- The `VC_KEY` was historically in `config.json` — **removed** in this version
+- Private key (`PK`) never touches disk outside `.env`
+- State writes use atomic file operations (`tempfile` + `os.replace`) — no corruption on crash
 
 ---
 

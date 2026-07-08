@@ -205,6 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-/data
+/.agents
+*.local
 *.json
-notify.py
