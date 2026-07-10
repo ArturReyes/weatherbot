@@ -4,6 +4,8 @@ import unittest
 
 import weatherbet
 from trading_risk import (
+    RiskLimits,
+    assess_trade_risk,
     contract_matches_strategy,
     extract_market_date,
     fee_adjusted_ev,
@@ -193,6 +195,23 @@ class FeeMathTests(unittest.TestCase):
     def test_weather_strategy_public_math_accepts_fee_rate(self) -> None:
         self.assertEqual(weatherbet.calc_ev(0.30, 0.25, 0.05), 0.1566)
         self.assertEqual(weatherbet.calc_kelly(0.30, 0.25, 0.05), 0.0137)
+
+
+class PaperRiskParityTests(unittest.TestCase):
+    def test_cost_is_counted_as_open_paper_exposure(self) -> None:
+        decision = assess_trade_risk(
+            {"positions": [{"status": "open", "cost": 2.5, "city_slug": "nyc", "date": "2026-07-09"}]},
+            size_usdc=0.1,
+            city_slug="nyc",
+            date_str="2026-07-09",
+            signal_created_at=100.0,
+            bankroll=25.0,
+            limits=RiskLimits(0.25, 0.10, 0.05, 5, 120),
+            now_ts=101.0,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "event_exposure_limit")
 
 
 if __name__ == "__main__":

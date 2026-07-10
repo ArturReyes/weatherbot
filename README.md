@@ -16,13 +16,14 @@ No math, no complexity. Just the core logic — good for understanding how the s
 ### `weatherbet.py` — Full Bot (current)
 Everything in v1, plus:
 - **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
-- **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
+- **3 forecast sources** — ECMWF (global), real NOAA HRRR Conus (US, hourly), METAR (real-time observations)
 - **Expected Value** — skips trades where the math doesn't work
 - **Kelly Criterion** — sizes positions based on edge strength
 - **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
 - **Slippage filter** — skips markets with spread > $0.03
 - **Self-calibration** — learns sigma and bias by city/source/lead-time bucket
 - **Bias correction** — applies capped forecast corrections before probability calculation
+- **Structural edge strategies** — calibrated mean, near-lock, underdispersion tails, model-lag, and gated NO-token entries
 - **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
 
 ### `live_executor.py` — Live Trading
@@ -32,6 +33,7 @@ Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via `polymarke
 - Fresh market revalidation before order submission
 - Portfolio risk gates and exposure limits
 - Stop-loss, take-profit, trailing stop exits
+- Strategy-aware exits (near-lock positions hold to resolution unless invalidated by METAR)
 - Circuit breaker (stops after 5 consecutive errors)
 - Telegram notifications
 - Atomic state file writes (no corruption on crash)
@@ -43,13 +45,13 @@ Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via `polymarke
 Polymarket runs markets like "Will the highest temperature in Chicago be between 46–47°F on March 7?" These markets are often mispriced — the forecast says 78% likely but the market is trading at 8 cents.
 
 The bot:
-1. Fetches forecasts from ECMWF and HRRR via Open-Meteo (free, no key required)
+1. Fetches forecasts from ECMWF and real HRRR Conus via Open-Meteo (free, no key required)
 2. Gets real-time observations from METAR airport stations
 3. Applies city/source/lead-time calibration and capped bias correction
-4. Finds the matching temperature bucket on Polymarket
-5. Calculates fee-adjusted Expected Value — only enters if the math is positive
-6. Sizes the position using fractional Kelly Criterion
-7. Monitors stops every 10 minutes, full scan every hour
+4. Generates ranked strategy candidates instead of only checking the bucket containing the mean
+5. Scores calibrated-mean, near-lock, underdispersion-tail, model-lag, and gated NO-token opportunities by fee-adjusted EV
+6. Sizes the position using fractional Kelly Criterion and strategy multipliers
+7. Monitors exits with strategy-aware rules
 8. Auto-resolves markets by querying Polymarket API directly
 
 ---
@@ -96,13 +98,16 @@ cp .env.example .env
 
 ### 1. Paper trade first
 
-This is the safe starting mode. It writes simulated positions and calibration data under `data/`.
+This is the safe starting mode. It writes simulated positions and calibration data under `data/`, and mirrors the operator console to `paper_trading.log`.
 
 ```bash
 python weatherbet.py run       # start paper trading loop
 python weatherbet.py status    # balance and open positions
 python weatherbet.py report    # full breakdown of all resolved markets
+python weatherbet.py validate  # chronological paper holdout + live-readiness gates
 ```
+
+`paper_trading.log` is plain text with ANSI color codes stripped, so it is safe to paste into reviews or inspect with `tail -f paper_trading.log`.
 
 You can also run `python weatherbet.py` with no argument; it defaults to `run`.
 
@@ -220,6 +225,7 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 | `max_slippage` | 0.03 | Max allowed ask-bid spread |
 | `kelly_fraction` | 0.25 | Fraction of Kelly to bet (0.25 = quarter-Kelly) |
 | `scan_interval` | 3600 | Seconds between full market scans |
+| `opportunity_scan_interval_seconds` | 300 | Faster structural-edge scan cadence; capped by `scan_interval` |
 | `calibration_min` | 30 | Minimum resolved samples before writing calibration |
 | `max_total_exposure_pct` | 0.25 | Max total portfolio exposure as share of bankroll |
 | `max_event_exposure_pct` | 0.10 | Max same city/date exposure as share of bankroll |
@@ -227,10 +233,31 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 | `max_open_positions` | 5 | Max active positions |
 | `max_signal_age_seconds` | 120 | Rejects stale signals before live order submission |
 | `forecast_cache_ttl_ecmwf_seconds` | 1800 | ECMWF forecast cache TTL |
-| `forecast_cache_ttl_hrrr_seconds` | 600 | HRRR forecast cache TTL |
+| `forecast_cache_ttl_hrrr_seconds` | 600 | Real HRRR Conus forecast cache TTL (US only) |
 | `forecast_cache_ttl_metar_seconds` | 45 | METAR observation cache TTL |
 | `max_bias_correction_f` | 3.0 | Max forecast bias correction in °F |
 | `max_bias_correction_c` | 1.5 | Max forecast bias correction in °C |
+| `strategy_calibrated_mean_enabled` | true | Enable existing corrected-forecast bucket strategy |
+| `strategy_near_lock_enabled` | true | Enable D+0 near-lock only after continuous local-day METAR coverage |
+| `strategy_underdispersion_enabled` | false | Reserve for a future true-ensemble feed; source disagreement is not ensemble spread |
+| `strategy_model_lag_enabled` | true | Require both a forecast-probability move and insufficient bucket-specific market repricing |
+| `enable_no_trades` | false | Disabled by default; when enabled, entries require the NO token's own CLOB book quote |
+| `near_lock_hours` | 18 | Hours-to-resolution window for near-lock |
+| `near_lock_min_prob` | 0.92 | Minimum near-lock probability |
+| `near_lock_max_price` | 0.82 | Strategy-specific max entry price for near-lock |
+| `near_lock_sigma_f` | 0.75 | Conservative near-lock uncertainty in °F |
+| `near_lock_sigma_c` | 0.4 | Conservative near-lock uncertainty in °C |
+| `underdispersion_ratio_min` | 1.6 | Minimum calibrated-sigma / true-ensemble-spread ratio when an ensemble feed is added |
+| `underdispersion_tail_max_price` | 0.14 | Max YES price for underdispersion tail entries |
+| `model_lag_max_reprice_ratio` | 0.5 | Market may absorb at most this fraction of the forecast probability move |
+| `validation_holdout_fraction` | 0.25 | Latest chronological share of closed paper trades reserved for holdout |
+| `promotion_min_holdout_trades` | 30 | Required holdout trades per strategy before live eligibility |
+| `promotion_min_brier_samples` | 30 | Required resolved probability samples per strategy |
+| `promotion_min_realized_roi` | 0.0 | Minimum realised ROI on the holdout set |
+| `promotion_max_brier_score` | 0.25 | Maximum holdout Brier score |
+| `promotion_max_drawdown_pct` | 0.10 | Maximum holdout drawdown as share of paper bankroll |
+| `require_validation_for_live` | true | Block live scans until every enabled strategy passes the chronological promotion gates |
+| `no_trade_min_ev` | 0.15 | Stricter EV gate for NO-token entries |
 
 ---
 
@@ -239,7 +266,6 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 ```bash
 # 1. Install everything
 pip install -r requirements.txt
-pip install --pre polymarket-client
 
 # 2. Set up environment file
 cp .env.example .env
@@ -251,6 +277,7 @@ python -c "from weatherbet import bucket_prob; print('weatherbet OK')"
 
 # 4. Paper trade for several days and collect calibration data
 python weatherbet.py run
+tail -f paper_trading.log
 python weatherbet.py status
 python weatherbet.py report
 
@@ -270,7 +297,8 @@ Do not use `python live_executor.py scan` as a dry run. It can place orders.
 All data is saved to `data/markets/` — one JSON file per market. Each file contains:
 - Hourly forecast snapshots (ECMWF, HRRR, METAR)
 - Market price history
-- Position details (entry, stop, PnL, raw/corrected forecast, bias, raw/corrected EV)
+- Position details (strategy, YES/NO side, entry, stop, PnL, raw/corrected forecast, bias, raw/corrected EV)
+- Structural-edge diagnostics (fair price, edge, observed high, remaining max, dispersion ratio, source spread, model-lag shift)
 - Final resolution outcome
 
 Calibration is saved to `data/calibration.json`. The bot writes aggregate sigma entries and city/source/lead-bucket entries containing bias, raw bias, sigma, and sample count. Live signal generation uses the corrected forecast before probability calculation.

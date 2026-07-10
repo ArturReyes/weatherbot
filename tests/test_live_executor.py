@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import weatherbet
@@ -14,6 +16,7 @@ from live_executor import (
     _extract_date_from_slug,
     calc_kelly,
     generate_signals,
+    refresh_signal_with_live_market,
 )
 from live_trading import OrderSubmission, PositionSnapshot
 
@@ -202,6 +205,49 @@ class ForecastCacheTests(unittest.TestCase):
 
 
 class LiveExecutorEntryTests(unittest.TestCase):
+    def test_scan_stops_before_market_io_when_promotion_gate_is_not_ready(self) -> None:
+        executor = LiveExecutor(
+            private_key="unused",
+            gateway=FakeGateway(),
+            state=make_state(),
+            state_saver=lambda state: None,
+        )
+        readiness = SimpleNamespace(
+            decision=SimpleNamespace(ready=False, reasons=("insufficient holdout",)),
+        )
+
+        with (
+            patch("live_executor.weatherbet.live_readiness_report", return_value=readiness),
+            patch("live_executor.fetch_outdoor_markets") as fetch_markets,
+        ):
+            placed = executor.scan_and_execute()
+
+        self.assertEqual(placed, 0)
+        fetch_markets.assert_not_called()
+
+    def test_no_revalidation_uses_the_no_token_order_book(self) -> None:
+        signal = make_signal()
+        signal = dataclasses.replace(
+            signal,
+            token_id="token-no",
+            outcome_side="NO",
+            probability=0.80,
+            entry_price=0.20,
+            spread=0.02,
+        )
+        detail = fresh_market_detail()
+        with patch("live_executor.fetch_executable_quote") as fetch_quote:
+            fetch_quote.return_value = type("Quote", (), {"bid": 0.18, "ask": 0.20})()
+            refreshed = refresh_signal_with_live_market(
+                signal,
+                detail,
+                balance_ref=25.0,
+            )
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.entry_price, 0.20)
+        fetch_quote.assert_called_once_with("token-no")
     def test_real_gamma_slug_date_is_supported(self) -> None:
         self.assertEqual(
             _extract_date_from_slug(
@@ -239,16 +285,22 @@ class LiveExecutorEntryTests(unittest.TestCase):
         hrrr.assert_not_called()
 
     def test_signal_ev_and_kelly_include_market_fee(self) -> None:
+        end_dt = datetime.now(timezone.utc) + timedelta(hours=36)
+        date_str = end_dt.strftime("%Y-%m-%d")
+        month = end_dt.strftime("%B")
+        day = end_dt.day
+        short_month = end_dt.strftime("%b")
+        short_year = str(end_dt.year)[2:]
         market = {
             "id": "market-1",
-            "question": "Will the highest temperature in New York City be 80°F on July 9?",
-            "slug": "highest-temperature-in-new-york-city-on-july-9-2026-80f",
+            "question": f"Will the highest temperature in New York City be 80°F on {month} {day}?",
+            "slug": f"highest-temperature-in-new-york-city-on-{month.lower()}-{day}-{end_dt.year}-80f",
             "description": (
                 "The highest temperature recorded by NOAA at LaGuardia Airport in "
-                "degrees Fahrenheit on 9 Jul '26. The resolution source is the highest reading "
+                f"degrees Fahrenheit on {day} {short_month} '{short_year}. The resolution source is the highest reading "
                 "under Temp: https://www.weather.gov/wrh/timeseries?site=KLGA"
             ),
-            "endDate": "2026-07-09T23:00:00Z",
+            "endDate": end_dt.isoformat(),
             "volume": 1000,
             "acceptingOrders": True,
             "enableOrderBook": True,
@@ -265,7 +317,7 @@ class LiveExecutorEntryTests(unittest.TestCase):
         detail["feeSchedule"] = {"rate": 0.05}
 
         with (
-            patch("live_executor.get_ecmwf", return_value={"2026-07-09": 80}),
+            patch("live_executor.get_ecmwf", return_value={date_str: 80}),
             patch("live_executor.get_hrrr", return_value={}),
             patch("live_executor.get_metar", return_value=None),
             patch("live_executor.fetch_market_detail", return_value=detail),

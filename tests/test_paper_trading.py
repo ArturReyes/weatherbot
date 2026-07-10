@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from paper_trading import close_position, revalidate_signal, yes_quote
+from paper_trading import close_position, no_quote, revalidate_signal, yes_quote
 
 
 class PaperQuoteTests(unittest.TestCase):
@@ -23,6 +24,16 @@ class PaperQuoteTests(unittest.TestCase):
 
         self.assertEqual(quote.bid, 0.20)
         self.assertEqual(quote.ask, 0.20)
+
+    def test_no_quote_requires_independent_executable_prices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "independently executable"):
+            no_quote({"outcomePrices": '["0.20", "0.80"]', "bestBid": 0.19, "bestAsk": 0.21})
+
+    def test_no_quote_uses_explicit_no_prices(self) -> None:
+        quote = no_quote({"outcomePrices": '["0.20", "0.80"]', "noBestBid": 0.78, "noBestAsk": 0.80})
+
+        self.assertEqual(quote.bid, 0.78)
+        self.assertEqual(quote.ask, 0.80)
 
 
 class PaperSignalTests(unittest.TestCase):
@@ -70,6 +81,23 @@ class PaperSignalTests(unittest.TestCase):
         self.assertEqual(refreshed["fee_rate"], 0.05)
         self.assertEqual(refreshed["shares"], 24.04)
         self.assertEqual(refreshed["raw_ev"], 0.4423)
+
+    def test_no_revalidation_uses_the_no_token_order_book(self) -> None:
+        signal = {"side": "NO", "token_id": "no-token", "p": 0.80, "cost": 5.0}
+        with patch("paper_trading.fetch_executable_quote") as fetch_quote:
+            fetch_quote.return_value = type("Quote", (), {"bid": 0.18, "ask": 0.20})()
+            refreshed = revalidate_signal(
+                signal,
+                {"outcomePrices": '["0.20", "0.80"]'},
+                min_ev=0.10,
+                max_price=0.90,
+                max_spread=0.03,
+            )
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed["entry_price"], 0.20)
+        fetch_quote.assert_called_once_with("no-token")
 
 
 class PaperCloseTests(unittest.TestCase):

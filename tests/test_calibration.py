@@ -194,8 +194,8 @@ class RunCalibrationTests(unittest.TestCase):
                 "event_end_date": "2026-07-03T00:00:00+00:00",
                 "position": {"opened_at": "2026-07-01T13:00:00+00:00"},
                 "forecast_snapshots": [
-                    {"ts": "2026-07-01T12:00:00+00:00", "hrrr": 74},
-                    {"ts": "2026-07-01T14:00:00+00:00", "hrrr": 70},
+                    {"ts": "2026-07-01T12:00:00+00:00", "hrrr_conus": 74},
+                    {"ts": "2026-07-01T14:00:00+00:00", "hrrr_conus": 70},
                 ],
             },
             {
@@ -205,8 +205,8 @@ class RunCalibrationTests(unittest.TestCase):
                 "event_end_date": "2026-07-04T00:00:00+00:00",
                 "position": {"opened_at": "2026-07-02T13:00:00+00:00"},
                 "forecast_snapshots": [
-                    {"ts": "2026-07-02T12:00:00+00:00", "hrrr": 75},
-                    {"ts": "2026-07-02T14:00:00+00:00", "hrrr": 71},
+                    {"ts": "2026-07-02T12:00:00+00:00", "hrrr_conus": 75},
+                    {"ts": "2026-07-02T14:00:00+00:00", "hrrr_conus": 71},
                 ],
             },
         ]
@@ -233,13 +233,13 @@ class RunCalibrationTests(unittest.TestCase):
                 weatherbet.BIAS_PRIOR_STRENGTH = original_prior
                 weatherbet.install_calibration(original_cal)
 
-        self.assertEqual(cal["nyc_hrrr"]["sigma"], 4.0)
-        self.assertEqual(cal["nyc_hrrr"]["n"], 2)
-        self.assertEqual(cal["nyc_hrrr_24_48h"]["bias"], 4.0)
-        self.assertEqual(cal["nyc_hrrr_24_48h"]["raw_bias"], 4.0)
-        self.assertEqual(cal["nyc_hrrr_24_48h"]["sigma"], 4.0)
-        self.assertEqual(cal["nyc_hrrr_24_48h"]["n"], 2)
-        self.assertEqual(cal["nyc_hrrr_24_48h"]["lead_bucket"], "24_48h")
+        self.assertEqual(cal["nyc_hrrr_conus"]["sigma"], 4.0)
+        self.assertEqual(cal["nyc_hrrr_conus"]["n"], 2)
+        self.assertEqual(cal["nyc_hrrr_conus_24_48h"]["bias"], 4.0)
+        self.assertEqual(cal["nyc_hrrr_conus_24_48h"]["raw_bias"], 4.0)
+        self.assertEqual(cal["nyc_hrrr_conus_24_48h"]["sigma"], 4.0)
+        self.assertEqual(cal["nyc_hrrr_conus_24_48h"]["n"], 2)
+        self.assertEqual(cal["nyc_hrrr_conus_24_48h"]["lead_bucket"], "24_48h")
 
 
 if __name__ == "__main__":

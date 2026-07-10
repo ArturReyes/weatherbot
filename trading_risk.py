@@ -87,7 +87,7 @@ def assess_trade_risk(
 
 
 def _position_exposure(position: dict) -> float:
-    amount = max(0.0, float(position.get("amount") or 0.0))
+    amount = max(0.0, float(position.get("amount") or position.get("cost") or 0.0))
     if position.get("status") in {"submitting", "pending", "unknown"}:
         requested = max(0.0, float(position.get("requested_amount") or 0.0))
         return max(amount, requested)
