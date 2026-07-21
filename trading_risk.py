@@ -14,6 +14,16 @@ WEATHER_TAKER_FEE_RATE = 0.05
 class ContractValidation:
     valid: bool
     reason: str | None = None
+    contract: "ResolutionContract | None" = None
+
+
+@dataclass(frozen=True)
+class ResolutionContract:
+    provider: str
+    station: str
+    unit: str
+    date: str
+    rule: str = "daily_high"
 
 
 @dataclass(frozen=True)
@@ -118,7 +128,10 @@ def extract_market_date(slug: str) -> str | None:
         try:
             return datetime.strptime(iso.group(0), "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            return None
+            # Fahrenheit range suffixes such as ``2026-72-73f`` resemble an
+            # ISO date.  If that candidate is invalid, continue to the named
+            # ``-on-july-21-2026-`` date instead of rejecting the contract.
+            pass
 
     named = re.search(
         r"-on-(january|february|march|april|may|june|july|august|"
@@ -159,10 +172,13 @@ def contract_matches_strategy(
     resolution_unit = "degrees fahrenheit" if unit.upper() == "F" else "degrees celsius"
     if resolution_unit not in description_lower:
         return ContractValidation(False, "resolution_unit_mismatch")
-    if f"site={station.lower()}" not in description_lower:
-        return ContractValidation(False, "station_mismatch")
-    if "noaa" not in description_lower or "highest reading" not in description_lower:
+    provider = _resolution_provider(description_lower)
+    if provider is None:
         return ContractValidation(False, "resolution_source_mismatch")
+    if not _description_matches_station(description, station, provider):
+        return ContractValidation(False, "station_mismatch")
+    if "highest reading" not in description_lower and "highest temperature" not in description_lower:
+        return ContractValidation(False, "resolution_rule_mismatch")
     if extract_market_date(slug) != date_str:
         return ContractValidation(False, "date_mismatch")
     if not _description_matches_date(description_lower, date_str):
@@ -171,7 +187,31 @@ def contract_matches_strategy(
         return ContractValidation(False, "orderbook_disabled")
     if market.get("acceptingOrders") is not True:
         return ContractValidation(False, "orders_not_accepted")
-    return ContractValidation(True)
+    return ContractValidation(
+        True,
+        contract=ResolutionContract(
+            provider=provider,
+            station=station.upper(),
+            unit=unit.upper(),
+            date=date_str,
+        ),
+    )
+
+
+def _resolution_provider(description: str) -> str | None:
+    if "weather.gov" in description or "noaa" in description:
+        return "noaa"
+    if "wunderground.com" in description or "weather underground" in description or "wunderground" in description:
+        return "wunderground"
+    return None
+
+
+def _description_matches_station(description: str, station: str, provider: str) -> bool:
+    expected = station.upper()
+    if provider == "noaa":
+        match = re.search(r"[?&]site=([A-Z0-9]+)(?:&|\s|$)", description, re.IGNORECASE)
+        return match is not None and match.group(1).upper() == expected
+    return re.search(rf"(?<![A-Z0-9]){re.escape(expected)}(?![A-Z0-9])", description, re.IGNORECASE) is not None
 
 
 def market_fee_rate(market: dict) -> float:

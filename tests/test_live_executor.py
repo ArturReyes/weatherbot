@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import weatherbet
+import live_executor
 from live_executor import (
     ForecastCache,
     LiveExecutor,
@@ -16,6 +17,7 @@ from live_executor import (
     _extract_date_from_slug,
     calc_kelly,
     generate_signals,
+    live_reentry_reason,
     refresh_signal_with_live_market,
 )
 from live_trading import OrderSubmission, PositionSnapshot
@@ -86,6 +88,15 @@ def fresh_market_detail(*, best_bid: float = 0.24, best_ask: float = 0.25) -> di
         "bestAsk": best_ask,
         "conditionId": "condition-1",
     }
+
+
+def executable_quote(*, bid: float = 0.24, ask: float = 0.25, min_order_size: float = 5.0):
+    return SimpleNamespace(
+        bid=bid,
+        ask=ask,
+        min_order_size=min_order_size,
+        tick_size=0.01,
+    )
 
 
 class FakeGateway:
@@ -205,6 +216,34 @@ class ForecastCacheTests(unittest.TestCase):
 
 
 class LiveExecutorEntryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._original_calibration = weatherbet._cal
+        weatherbet.install_calibration({})
+
+    def tearDown(self) -> None:
+        weatherbet.install_calibration(self._original_calibration)
+
+    def test_live_calibrated_mean_keeps_thirty_sample_maturity_gate(self) -> None:
+        self.assertEqual(live_executor.STRATEGY_CONFIG.calibrated_mean_min_samples, 30)
+
+    def test_live_reentry_fails_closed_by_default(self) -> None:
+        state = make_state()
+        state["positions"].append(
+            {
+                "token_id": "token-1",
+                "status": "closed",
+                "exited_at": "2026-07-15T10:00:00+00:00",
+            }
+        )
+
+        reason = live_reentry_reason(
+            state,
+            token_id="token-1",
+            now=datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(reason, "live re-entry disabled")
+
     def test_scan_stops_before_market_io_when_promotion_gate_is_not_ready(self) -> None:
         executor = LiveExecutor(
             private_key="unused",
@@ -237,7 +276,7 @@ class LiveExecutorEntryTests(unittest.TestCase):
         )
         detail = fresh_market_detail()
         with patch("live_executor.fetch_executable_quote") as fetch_quote:
-            fetch_quote.return_value = type("Quote", (), {"bid": 0.18, "ask": 0.20})()
+            fetch_quote.return_value = executable_quote(bid=0.18, ask=0.20)
             refreshed = refresh_signal_with_live_market(
                 signal,
                 detail,
@@ -251,7 +290,7 @@ class LiveExecutorEntryTests(unittest.TestCase):
     def test_real_gamma_slug_date_is_supported(self) -> None:
         self.assertEqual(
             _extract_date_from_slug(
-                "highest-temperature-in-tel-aviv-on-april-7-2026-21c"
+                "highest-temperature-in-paris-on-april-7-2026-21c"
             ),
             "2026-04-07",
         )
@@ -317,10 +356,22 @@ class LiveExecutorEntryTests(unittest.TestCase):
         detail["feeSchedule"] = {"rate": 0.05}
 
         with (
+            patch(
+                "live_executor.STRATEGY_CONFIG",
+                dataclasses.replace(
+                    live_executor.STRATEGY_CONFIG,
+                    strategy_calibrated_mean_enabled=True,
+                    calibrated_mean_min_samples=0,
+                ),
+            ),
             patch("live_executor.get_ecmwf", return_value={date_str: 80}),
             patch("live_executor.get_hrrr", return_value={}),
             patch("live_executor.get_metar", return_value=None),
             patch("live_executor.fetch_market_detail", return_value=detail),
+            patch(
+                "live_executor.fetch_executable_quote",
+                return_value=executable_quote(bid=0.09, ask=0.10, min_order_size=1.0),
+            ),
         ):
             signals = generate_signals([market], make_state())
 
@@ -368,13 +419,21 @@ class LiveExecutorEntryTests(unittest.TestCase):
                     "bias": 2.0,
                     "raw_bias": 2.2,
                     "sigma": 2.0,
-                    "n": 12,
+                    "n": 30,
                 }
             })
             with (
+                patch(
+                    "live_executor.STRATEGY_CONFIG",
+                    dataclasses.replace(live_executor.STRATEGY_CONFIG, strategy_calibrated_mean_enabled=True),
+                ),
                 patch("live_executor.get_ecmwf", return_value={date_str: 82}),
                 patch("live_executor.get_hrrr", return_value={}),
                 patch("live_executor.fetch_market_detail", return_value=market),
+                patch(
+                    "live_executor.fetch_executable_quote",
+                    return_value=executable_quote(bid=0.09, ask=0.10, min_order_size=1.0),
+                ),
             ):
                 signals = generate_signals([market], make_state())
         finally:
@@ -388,21 +447,28 @@ class LiveExecutorEntryTests(unittest.TestCase):
         self.assertEqual(signal.forecast_bias, 2.0)
         self.assertEqual(signal.forecast_raw_bias, 2.2)
         self.assertEqual(signal.forecast_lead_bucket, "24_48h")
-        self.assertEqual(signal.forecast_calibration_n, 12)
+        self.assertEqual(signal.forecast_calibration_n, 30)
         self.assertLess(signal.raw_probability, signal.probability)
         self.assertLess(signal.raw_ev, signal.ev)
 
     def test_signal_generation_reuses_forecast_cache_for_same_city_date(self) -> None:
+        end_dt = datetime.now(timezone.utc) + timedelta(hours=36)
+        date_str = end_dt.strftime("%Y-%m-%d")
+        month = end_dt.strftime("%B").lower()
+        day = end_dt.day
+        year = end_dt.year
+        short_month = end_dt.strftime("%b")
+        short_year = str(year)[2:]
         market_1 = {
             "id": "market-1",
-            "question": "Will the highest temperature in New York City be 80°F on July 10?",
-            "slug": "highest-temperature-in-new-york-city-on-july-10-2026-80f",
+            "question": f"Will the highest temperature in New York City be 80°F on {end_dt.strftime('%B')} {day}?",
+            "slug": f"highest-temperature-in-new-york-city-on-{month}-{day}-{year}-80f",
             "description": (
                 "The highest temperature recorded by NOAA at LaGuardia Airport in "
-                "degrees Fahrenheit on 10 Jul '26. The resolution source is the highest reading "
+                f"degrees Fahrenheit on {day} {short_month} '{short_year}. The resolution source is the highest reading "
                 "under Temp: https://www.weather.gov/wrh/timeseries?site=KLGA"
             ),
-            "endDate": "2026-07-10T23:00:00Z",
+            "endDate": end_dt.isoformat(),
             "volume": 1000,
             "acceptingOrders": True,
             "enableOrderBook": True,
@@ -421,14 +487,26 @@ class LiveExecutorEntryTests(unittest.TestCase):
         details = {"market-1": market_1, "market-2": market_2}
 
         with (
-            patch("live_executor.get_ecmwf", return_value={"2026-07-10": 80}) as ecmwf,
+            patch(
+                "live_executor.STRATEGY_CONFIG",
+                dataclasses.replace(
+                    live_executor.STRATEGY_CONFIG,
+                    strategy_calibrated_mean_enabled=True,
+                    calibrated_mean_min_samples=0,
+                ),
+            ),
+            patch("live_executor.get_ecmwf", return_value={date_str: 80}) as ecmwf,
             patch("live_executor.get_hrrr", return_value={}),
             patch("live_executor.fetch_market_detail", side_effect=lambda mid: details[mid]),
+            patch(
+                "live_executor.fetch_executable_quote",
+                return_value=executable_quote(bid=0.09, ask=0.10, min_order_size=1.0),
+            ),
         ):
             signals = generate_signals([market_1, market_2], make_state())
 
         self.assertEqual(len(signals), 2)
-        ecmwf.assert_called_once_with("nyc", {"2026-07-10"})
+        ecmwf.assert_called_once_with("nyc", {date_str})
 
     def test_entry_persists_intent_before_submission_and_uses_exchange_fill(self) -> None:
         gateway = FakeGateway()
@@ -445,7 +523,10 @@ class LiveExecutorEntryTests(unittest.TestCase):
             state_saver=lambda state: saved.append(copy.deepcopy(state)),
         )
 
-        with patch("live_executor.fetch_market_detail", return_value=fresh_market_detail()):
+        with (
+            patch("live_executor.fetch_market_detail", return_value=fresh_market_detail()),
+            patch("live_executor.fetch_executable_quote", return_value=executable_quote()),
+        ):
             placed = executor._execute_signal(make_signal())
 
         self.assertTrue(placed)
@@ -496,7 +577,10 @@ class LiveExecutorEntryTests(unittest.TestCase):
             state_saver=lambda state: None,
         )
 
-        with patch("live_executor.fetch_market_detail", return_value=fresh_market_detail()):
+        with (
+            patch("live_executor.fetch_market_detail", return_value=fresh_market_detail()),
+            patch("live_executor.fetch_executable_quote", return_value=executable_quote()),
+        ):
             placed = executor._execute_signal(make_signal())
 
         self.assertFalse(placed)
@@ -514,7 +598,10 @@ class LiveExecutorEntryTests(unittest.TestCase):
             state_saver=lambda state: None,
         )
 
-        with patch("live_executor.fetch_market_detail", return_value=fresh_market_detail()):
+        with (
+            patch("live_executor.fetch_market_detail", return_value=fresh_market_detail()),
+            patch("live_executor.fetch_executable_quote", return_value=executable_quote()),
+        ):
             placed = executor._execute_signal(make_signal())
 
         self.assertFalse(placed)
@@ -535,9 +622,15 @@ class LiveExecutorEntryTests(unittest.TestCase):
             state_saver=lambda state: None,
         )
 
-        with patch(
-            "live_executor.fetch_market_detail",
-            return_value=fresh_market_detail(best_bid=0.29, best_ask=0.30),
+        with (
+            patch(
+                "live_executor.fetch_market_detail",
+                return_value=fresh_market_detail(best_bid=0.29, best_ask=0.30),
+            ),
+            patch(
+                "live_executor.fetch_executable_quote",
+                return_value=executable_quote(bid=0.29, ask=0.30, min_order_size=1.0),
+            ),
         ):
             placed = executor._execute_signal(make_signal())
 
@@ -554,9 +647,15 @@ class LiveExecutorEntryTests(unittest.TestCase):
             state_saver=lambda state: None,
         )
 
-        with patch(
-            "live_executor.fetch_market_detail",
-            return_value=fresh_market_detail(best_bid=0.44, best_ask=0.46),
+        with (
+            patch(
+                "live_executor.fetch_market_detail",
+                return_value=fresh_market_detail(best_bid=0.44, best_ask=0.46),
+            ),
+            patch(
+                "live_executor.fetch_executable_quote",
+                return_value=executable_quote(bid=0.44, ask=0.46),
+            ),
         ):
             placed = executor._execute_signal(make_signal())
 
@@ -599,13 +698,19 @@ class LiveExecutorExitTests(unittest.TestCase):
             state_saver=lambda state: None,
         )
 
-        with patch(
-            "live_executor.fetch_market_detail",
-            return_value={
-                "endDate": "2026-07-09T23:00:00Z",
-                "outcomePrices": '["0.50", "0.50"]',
-                "clobTokenIds": '["token-1", "token-no"]',
-            },
+        with (
+            patch(
+                "live_executor.fetch_market_detail",
+                return_value={
+                    "endDate": "2026-07-09T23:00:00Z",
+                    "outcomePrices": '["0.50", "0.50"]',
+                    "clobTokenIds": '["token-1", "token-no"]',
+                },
+            ),
+            patch(
+                "live_executor.STRATEGY_CONFIG",
+                dataclasses.replace(live_executor.STRATEGY_CONFIG, standard_price_stop_enabled=True),
+            ),
         ):
             executor._check_positions()
 
@@ -614,6 +719,47 @@ class LiveExecutorExitTests(unittest.TestCase):
             [("token-1", Decimal("4.0"))],
         )
         self.assertEqual(len(gateway.sell_calls), 1)
+
+    def test_position_monitor_does_not_stop_standard_position_when_price_stops_disabled(self) -> None:
+        gateway = FakeGateway()
+        gateway.sell_price = Decimal("0.03")
+        gateway.positions = {
+            "token-1": PositionSnapshot("token-1", "condition-1", Decimal("10"), Decimal("0.045"))
+        }
+        state = make_state()
+        state["positions"].append(
+            {
+                "market_id": "market-1",
+                "token_id": "token-1",
+                "condition_id": "condition-1",
+                "status": "open",
+                "shares": 10.0,
+                "amount": 0.45,
+                "entry_price": 0.045,
+                "stop_price": None,
+                "exit_policy": "standard",
+                "city_name": "Paris",
+                "date": "2026-07-16",
+                "bucket_low": 34,
+                "bucket_high": 34,
+                "unit": "C",
+            }
+        )
+        executor = LiveExecutor(
+            private_key="unused",
+            gateway=gateway,
+            state=state,
+            state_saver=lambda state: None,
+        )
+
+        with patch(
+            "live_executor.fetch_market_detail",
+            return_value={"endDate": "2026-07-16T23:00:00Z"},
+        ):
+            executor._check_positions()
+
+        self.assertEqual(gateway.sell_calls, [])
+        self.assertEqual(state["positions"][0]["status"], "open")
 
     def test_redeemable_position_submits_and_confirms_redemption(self) -> None:
         gateway = FakeGateway()

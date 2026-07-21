@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from validation import PromotionPolicy, chronological_out_of_sample_report
+from validation import PromotionPolicy, chronological_out_of_sample_report, shadow_diagnostics
 
 
 def market(*, closed_at: str, pnl: float, probability: float, outcome: str, strategy: str = "calibrated_mean") -> dict:
@@ -11,6 +11,7 @@ def market(*, closed_at: str, pnl: float, probability: float, outcome: str, stra
         "resolved_outcome": outcome,
         "position": {
             "status": "closed",
+            "opened_at": closed_at,
             "closed_at": closed_at,
             "pnl": pnl,
             "cost": 1.0,
@@ -25,6 +26,38 @@ def market(*, closed_at: str, pnl: float, probability: float, outcome: str, stra
 
 
 class ChronologicalValidationTests(unittest.TestCase):
+    def test_archived_reentry_positions_are_included_in_validation(self) -> None:
+        reentered = market(
+            closed_at="2026-07-02T00:00:00+00:00",
+            pnl=1.0,
+            probability=0.8,
+            outcome="win",
+        )
+        archived = dict(reentered["position"])
+        archived.update(
+            {
+                "opened_at": "2026-07-01T00:00:00+00:00",
+                "closed_at": "2026-07-01T12:00:00+00:00",
+                "pnl": -0.25,
+                "eventual_outcome": "win",
+            }
+        )
+        reentered["position_history"] = [archived]
+
+        report = chronological_out_of_sample_report(
+            [reentered],
+            policy=PromotionPolicy(
+                holdout_fraction=1.0,
+                min_holdout_trades=2,
+                min_brier_samples=2,
+                max_drawdown_pct=1.0,
+            ),
+            bankroll=10.0,
+        )
+
+        self.assertEqual(report.holdout["calibrated_mean"].trades, 2)
+        self.assertEqual(report.holdout["calibrated_mean"].brier_samples, 2)
+
     def test_latest_records_are_the_only_holdout_records(self) -> None:
         markets = [
             market(closed_at=f"2026-07-0{day}T00:00:00+00:00", pnl=1.0, probability=0.8, outcome="win")
@@ -100,3 +133,57 @@ class ChronologicalValidationTests(unittest.TestCase):
 
         self.assertFalse(report.decision.ready)
         self.assertIn("model_lag: no holdout trades", report.decision.reasons)
+
+    def test_evaluation_cohort_filters_by_entry_time_not_resolution_time(self) -> None:
+        legacy = market(
+            closed_at="2026-07-11T00:00:00+00:00",
+            pnl=1.0,
+            probability=0.8,
+            outcome="win",
+        )
+        legacy["position"]["opened_at"] = "2026-07-09T00:00:00+00:00"
+        new = market(
+            closed_at="2026-07-12T00:00:00+00:00",
+            pnl=1.0,
+            probability=0.8,
+            outcome="win",
+        )
+        new["position"]["opened_at"] = "2026-07-11T00:00:00+00:00"
+
+        report = chronological_out_of_sample_report(
+            [legacy, new],
+            policy=PromotionPolicy(
+                evaluation_started_at="2026-07-10T00:00:00+00:00",
+                min_holdout_trades=1,
+                min_brier_samples=1,
+            ),
+            bankroll=10.0,
+        )
+
+        self.assertEqual(report.holdout["calibrated_mean"].trades, 1)
+
+
+class ShadowDiagnosticTests(unittest.TestCase):
+    def test_shadow_signals_are_reported_separately_from_promotion_trades(self) -> None:
+        traded = market(
+            closed_at="2026-07-12T00:00:00+00:00",
+            pnl=1.0,
+            probability=0.8,
+            outcome="win",
+        )
+        traded["shadow_signals"] = [{
+            "strategy": "calibrated_mean",
+            "probability": 0.7,
+            "eventual_outcome": "loss",
+        }]
+
+        report = chronological_out_of_sample_report(
+            [traded],
+            policy=PromotionPolicy(min_holdout_trades=1, min_brier_samples=1),
+            bankroll=10.0,
+        )
+        shadows = shadow_diagnostics([traded])
+
+        self.assertEqual(report.holdout["calibrated_mean"].trades, 1)
+        self.assertEqual(shadows["calibrated_mean"].signals, 1)
+        self.assertEqual(shadows["calibrated_mean"].brier_score, 0.49)

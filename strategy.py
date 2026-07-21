@@ -31,11 +31,19 @@ class StrategyConfig:
     min_ev: float = 0.10
     max_price: float = 0.45
     max_slippage: float = 0.03
+    max_relative_spread: float = 0.25
     strategy_calibrated_mean_enabled: bool = True
     strategy_near_lock_enabled: bool = True
     strategy_underdispersion_enabled: bool = False
     strategy_model_lag_enabled: bool = True
     enable_no_trades: bool = False
+    calibrated_mean_min_samples: int = 30
+    standard_price_stop_enabled: bool = False
+    standard_stop_loss_fraction: float = 0.20
+    standard_trailing_activation_return: float = 0.20
+    standard_take_profit_enabled: bool = True
+    standard_take_profit_24_48_price: float = 0.85
+    standard_take_profit_48_plus_price: float = 0.75
     near_lock_hours: float = 18.0
     near_lock_min_prob: float = 0.92
     near_lock_max_price: float = 0.82
@@ -57,11 +65,19 @@ class StrategyConfig:
             min_ev=float(min_ev),
             max_price=float(max_price),
             max_slippage=float(max_slippage),
+            max_relative_spread=float(cfg.get("max_relative_spread", 0.25)),
             strategy_calibrated_mean_enabled=bool(cfg.get("strategy_calibrated_mean_enabled", True)),
             strategy_near_lock_enabled=bool(cfg.get("strategy_near_lock_enabled", True)),
             strategy_underdispersion_enabled=bool(cfg.get("strategy_underdispersion_enabled", False)),
             strategy_model_lag_enabled=bool(cfg.get("strategy_model_lag_enabled", True)),
             enable_no_trades=bool(cfg.get("enable_no_trades", False)),
+            calibrated_mean_min_samples=int(cfg.get("calibrated_mean_min_samples", cfg.get("calibration_min", 30))),
+            standard_price_stop_enabled=bool(cfg.get("standard_price_stop_enabled", False)),
+            standard_stop_loss_fraction=float(cfg.get("standard_stop_loss_fraction", 0.20)),
+            standard_trailing_activation_return=float(cfg.get("standard_trailing_activation_return", 0.20)),
+            standard_take_profit_enabled=bool(cfg.get("standard_take_profit_enabled", True)),
+            standard_take_profit_24_48_price=float(cfg.get("standard_take_profit_24_48_price", 0.85)),
+            standard_take_profit_48_plus_price=float(cfg.get("standard_take_profit_48_plus_price", 0.75)),
             near_lock_hours=float(cfg.get("near_lock_hours", 18.0)),
             near_lock_min_prob=float(cfg.get("near_lock_min_prob", 0.92)),
             near_lock_max_price=float(cfg.get("near_lock_max_price", 0.82)),
@@ -120,6 +136,7 @@ class ForecastContext:
     forecast_raw_bias: float = 0.0
     forecast_lead_bucket: str | None = None
     forecast_calibration_n: int = 0
+    forecast_calibration_scope: str = "none"
 
 
 @dataclass(frozen=True)
@@ -153,6 +170,73 @@ class StrategyCandidate:
     market_price_shift: float | None = None
     reason: str = ""
     created_at_ts: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class PriceExitDecision:
+    """Pure market-price exit decision shared by paper and live execution."""
+
+    reason: str | None = None
+    stop_price: float | None = None
+    trailing_activated: bool = False
+
+
+def calibration_gate_reason(context: ForecastContext, config: StrategyConfig) -> str | None:
+    required = max(0, int(config.calibrated_mean_min_samples))
+    available = max(0, int(context.forecast_calibration_n))
+    if available < required:
+        return f"calibration {available}/{required}"
+    return None
+
+
+def initial_standard_stop_price(*, entry_bid: float, config: StrategyConfig) -> float | None:
+    """Anchor an optional stop to the executable entry bid, never the ask."""
+    if not config.standard_price_stop_enabled:
+        return None
+    fraction = min(max(float(config.standard_stop_loss_fraction), 0.0), 1.0)
+    return round(max(0.0, float(entry_bid)) * (1.0 - fraction), 6)
+
+
+def evaluate_price_exit(
+    *,
+    entry_price: float,
+    current_price: float,
+    hours_left: float,
+    exit_policy: str,
+    stop_price: float | None,
+    trailing_activated: bool,
+    config: StrategyConfig,
+) -> PriceExitDecision:
+    """Return an exit decision without performing I/O or mutating a position."""
+    if exit_policy == EXIT_HOLD_TO_RESOLUTION:
+        return PriceExitDecision(stop_price=stop_price, trailing_activated=trailing_activated)
+
+    if config.standard_take_profit_enabled:
+        target = None
+        if 24.0 <= hours_left < 48.0:
+            target = config.standard_take_profit_24_48_price
+        elif hours_left >= 48.0:
+            target = config.standard_take_profit_48_plus_price
+        if target is not None and current_price >= target:
+            return PriceExitDecision(
+                reason="take_profit",
+                stop_price=stop_price,
+                trailing_activated=trailing_activated,
+            )
+
+    if not config.standard_price_stop_enabled:
+        return PriceExitDecision(stop_price=stop_price, trailing_activated=trailing_activated)
+
+    activation_price = entry_price * (1.0 + config.standard_trailing_activation_return)
+    if not trailing_activated and current_price >= activation_price:
+        stop_price = round(entry_price, 6)
+        trailing_activated = True
+
+    if stop_price is not None and current_price <= stop_price:
+        reason = "trailing_stop" if trailing_activated and stop_price >= entry_price else "stop_loss"
+        return PriceExitDecision(reason, stop_price, trailing_activated)
+
+    return PriceExitDecision(stop_price=stop_price, trailing_activated=trailing_activated)
 
 
 def norm_cdf(value: float) -> float:
@@ -280,6 +364,8 @@ def _append_calibrated_mean(
     context: ForecastContext,
     config: StrategyConfig,
 ) -> None:
+    if calibration_gate_reason(context, config) is not None:
+        return
     yes_probability = bucket_probability(
         context.corrected_forecast_temp,
         bucket.bucket_low,
@@ -303,6 +389,7 @@ def _append_calibrated_mean(
             raw_yes_probability=raw_probability,
             max_price=config.max_price,
             max_spread=config.max_slippage,
+            max_relative_spread=config.max_relative_spread,
             min_ev=config.min_ev,
             size_multiplier=1.0,
             exit_policy=EXIT_STANDARD,
@@ -320,6 +407,7 @@ def _append_calibrated_mean(
             raw_yes_probability=raw_probability,
             max_price=config.max_price,
             max_spread=config.max_slippage,
+            max_relative_spread=config.max_relative_spread,
             min_ev=config.no_trade_min_ev,
             size_multiplier=config.no_trade_size_multiplier,
             exit_policy=EXIT_STANDARD,
@@ -360,6 +448,7 @@ def _append_near_lock(
         raw_yes_probability=None,
         max_price=config.near_lock_max_price,
         max_spread=config.max_slippage,
+        max_relative_spread=config.max_relative_spread,
         min_ev=config.min_ev,
         size_multiplier=config.near_lock_size_multiplier,
         exit_policy=EXIT_HOLD_TO_RESOLUTION,
@@ -399,6 +488,7 @@ def _append_underdispersion_tail(
         raw_yes_probability=None,
         max_price=config.underdispersion_tail_max_price,
         max_spread=config.max_slippage,
+        max_relative_spread=config.max_relative_spread,
         min_ev=config.min_ev,
         size_multiplier=config.underdispersion_size_multiplier,
         exit_policy=EXIT_STANDARD,
@@ -446,6 +536,7 @@ def _append_model_lag(
             raw_yes_probability=None,
             max_price=config.max_price,
             max_spread=config.max_slippage,
+            max_relative_spread=config.max_relative_spread,
             min_ev=config.min_ev,
             size_multiplier=config.model_lag_size_multiplier,
             exit_policy=EXIT_STANDARD,
@@ -469,6 +560,7 @@ def _append_model_lag(
             raw_yes_probability=None,
             max_price=config.max_price,
             max_spread=config.max_slippage,
+            max_relative_spread=config.max_relative_spread,
             min_ev=config.no_trade_min_ev,
             size_multiplier=min(config.model_lag_size_multiplier, config.no_trade_size_multiplier),
             exit_policy=EXIT_STANDARD,
@@ -489,6 +581,7 @@ def _append_side_candidate(
     raw_yes_probability: float | None,
     max_price: float,
     max_spread: float,
+    max_relative_spread: float,
     min_ev: float,
     size_multiplier: float,
     exit_policy: str,
@@ -501,7 +594,8 @@ def _append_side_candidate(
     if not quote_is_verified(bucket, side):
         return
     spread = ask - bid
-    if ask <= 0 or ask >= max_price or spread > max_spread:
+    relative_spread = spread / ask if ask > 0 else float("inf")
+    if ask <= 0 or ask >= max_price or spread > max_spread or relative_spread > max_relative_spread:
         return
     probability = probability_for_side(yes_probability, side)
     raw_probability = (

@@ -4,6 +4,7 @@ import unittest
 
 from strategy import (
     EXIT_HOLD_TO_RESOLUTION,
+    EXIT_STANDARD,
     NEAR_LOCK,
     NO,
     UNDERDISPERSION_TAIL,
@@ -11,8 +12,11 @@ from strategy import (
     BucketQuote,
     ForecastContext,
     StrategyConfig,
+    calibration_gate_reason,
     dispersion_ratio,
+    evaluate_price_exit,
     generate_strategy_candidates,
+    initial_standard_stop_price,
     near_lock_probability,
 )
 
@@ -54,12 +58,77 @@ def context(**overrides) -> ForecastContext:
         "corrected_forecast_temp": 80.0,
         "forecast_source": "ecmwf",
         "sigma": 4.0,
+        "forecast_calibration_n": 30,
     }
     values.update(overrides)
     return ForecastContext(**values)
 
 
 class StrategyTests(unittest.TestCase):
+    def test_calibrated_mean_fails_closed_without_required_samples(self) -> None:
+        ctx = context(forecast_calibration_n=0)
+        config = StrategyConfig(
+            calibrated_mean_min_samples=30,
+            strategy_near_lock_enabled=False,
+            strategy_model_lag_enabled=False,
+        )
+
+        candidates = generate_strategy_candidates(
+            buckets=[bucket(80, 80)],
+            context=ctx,
+            config=config,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(calibration_gate_reason(ctx, config), "calibration 0/30")
+
+    def test_standard_price_stop_is_disabled_by_default(self) -> None:
+        config = StrategyConfig()
+
+        self.assertIsNone(initial_standard_stop_price(entry_bid=0.03, config=config))
+        decision = evaluate_price_exit(
+            entry_price=0.045,
+            current_price=0.03,
+            hours_left=36,
+            exit_policy=EXIT_STANDARD,
+            stop_price=None,
+            trailing_activated=False,
+            config=config,
+        )
+
+        self.assertIsNone(decision.reason)
+
+    def test_enabled_price_stop_is_anchored_to_entry_bid(self) -> None:
+        config = StrategyConfig(standard_price_stop_enabled=True)
+
+        stop = initial_standard_stop_price(entry_bid=0.03, config=config)
+        decision = evaluate_price_exit(
+            entry_price=0.045,
+            current_price=0.03,
+            hours_left=36,
+            exit_policy=EXIT_STANDARD,
+            stop_price=stop,
+            trailing_activated=False,
+            config=config,
+        )
+
+        self.assertEqual(stop, 0.024)
+        self.assertIsNone(decision.reason)
+
+    def test_candidate_rejects_large_relative_spread_on_cheap_bucket(self) -> None:
+        candidates = generate_strategy_candidates(
+            buckets=[bucket(80, 80, yes_ask=0.01, yes_bid=0.005)],
+            context=context(),
+            config=StrategyConfig(
+                calibrated_mean_min_samples=30,
+                max_relative_spread=0.25,
+                strategy_near_lock_enabled=False,
+                strategy_model_lag_enabled=False,
+            ),
+        )
+
+        self.assertEqual(candidates, [])
+
     def test_near_lock_probability_from_observed_high_and_remaining_forecast(self) -> None:
         prob = near_lock_probability(
             observed_high=84.2,

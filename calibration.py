@@ -58,8 +58,13 @@ def lead_time_bucket(snapshot_ts: object, event_end_ts: object) -> str | None:
     return "72h_plus"
 
 
-def select_calibration_snapshot(market: dict, source: str) -> dict | None:
-    """Select the forecast known at entry, or the earliest pre-trade forecast."""
+def select_calibration_snapshot(
+    market: dict,
+    source: str,
+    *,
+    lead_bucket: str | None = None,
+) -> dict | None:
+    """Select a time-safe forecast, optionally from one lead-time bucket."""
     candidates = [
         snapshot
         for snapshot in market.get("forecast_snapshots", [])
@@ -70,13 +75,31 @@ def select_calibration_snapshot(market: dict, source: str) -> dict | None:
 
     position = market.get("position") or {}
     cutoff = _timestamp(position.get("opened_at") or position.get("entered_at"))
-    if cutoff is None:
-        return min(candidates, key=lambda item: _timestamp(item["ts"]))
-
-    eligible = [item for item in candidates if _timestamp(item["ts"]) <= cutoff]
-    if not eligible:
+    if cutoff is not None:
+        candidates = [item for item in candidates if _timestamp(item["ts"]) <= cutoff]
+    if lead_bucket is not None:
+        candidates = [
+            item
+            for item in candidates
+            if lead_time_bucket(item.get("ts"), _event_end_ts(market)) == lead_bucket
+        ]
+    if not candidates:
         return None
-    return max(eligible, key=lambda item: _timestamp(item["ts"]))
+
+    if cutoff is None and lead_bucket is None:
+        return min(candidates, key=lambda item: _timestamp(item["ts"]))
+    return max(candidates, key=lambda item: _timestamp(item["ts"]))
+
+
+def _has_calibration_observation(market: dict) -> bool:
+    return (
+        market.get("calibration_temp") is not None
+        and market.get("calibration_source") == "polymarket_winning_bucket"
+        and (
+        market.get("resolved") is True
+        or market.get("status") in {"closed", "resolved"}
+        )
+    )
 
 
 def calibration_errors(
@@ -90,17 +113,16 @@ def calibration_errors(
     for market in markets:
         if (
             market.get("city") != city
-            or not market.get("resolved")
-            or market.get("actual_temp") is None
+            or not _has_calibration_observation(market)
         ):
             continue
-        snapshot = select_calibration_snapshot(market, source)
+        snapshot = select_calibration_snapshot(
+            market,
+            source,
+            lead_bucket=lead_bucket,
+        )
         if snapshot is not None:
-            if lead_bucket is not None:
-                bucket = lead_time_bucket(snapshot.get("ts"), _event_end_ts(market))
-                if bucket != lead_bucket:
-                    continue
-            errors.append(float(snapshot[source]) - float(market["actual_temp"]))
+            errors.append(float(snapshot[source]) - float(market["calibration_temp"]))
     return errors
 
 
@@ -116,6 +138,7 @@ def _resolved_at(market: dict) -> datetime | None:
     return _timestamp(
         market.get("resolved_at")
         or market.get("closed_at")
+        or market.get("calibration_validated_at")
         or market.get("actual_temp_observed_at")
     )
 
@@ -147,8 +170,7 @@ def decaying_mean_error(
     for market in markets:
         if (
             market.get("city") != city
-            or not market.get("resolved")
-            or market.get("actual_temp") is None
+            or not _has_calibration_observation(market)
         ):
             continue
 
@@ -156,7 +178,11 @@ def decaying_mean_error(
         if cutoff is not None and resolved_at is not None and resolved_at > cutoff:
             continue
 
-        snapshot = select_calibration_snapshot(market, source)
+        snapshot = select_calibration_snapshot(
+            market,
+            source,
+            lead_bucket=lead_bucket,
+        )
         if snapshot is None:
             continue
 
@@ -166,12 +192,7 @@ def decaying_mean_error(
         if cutoff is not None and snapshot_time > cutoff:
             continue
 
-        if lead_bucket is not None:
-            bucket = lead_time_bucket(snapshot_time, _event_end_ts(market))
-            if bucket != lead_bucket:
-                continue
-
-        error = float(snapshot[source]) - float(market["actual_temp"])
+        error = float(snapshot[source]) - float(market["calibration_temp"])
         samples.append((snapshot_time, error))
 
     if not samples:
@@ -215,3 +236,21 @@ def rmse_sigma(errors: list[float], *, floor: float = 0.0) -> float:
         raise ValueError("At least one calibration error is required")
     rmse = math.sqrt(sum(error * error for error in errors) / len(errors))
     return max(float(floor), rmse)
+
+
+def regularized_sigma(
+    errors: list[float],
+    *,
+    prior_sigma: float,
+    prior_strength: float,
+    floor: float = 0.0,
+) -> float:
+    """Shrink small-sample RMSE variance toward a conservative prior."""
+    if not errors:
+        raise ValueError("At least one calibration error is required")
+    if prior_sigma <= 0 or prior_strength < 0:
+        raise ValueError("prior_sigma must be positive and prior_strength non-negative")
+    sample_variance = sum(error * error for error in errors) / len(errors)
+    weight = len(errors) / (len(errors) + prior_strength)
+    variance = weight * sample_variance + (1.0 - weight) * prior_sigma * prior_sigma
+    return max(float(floor), math.sqrt(variance))

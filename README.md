@@ -19,12 +19,13 @@ Everything in v1, plus:
 - **3 forecast sources** — ECMWF (global), real NOAA HRRR Conus (US, hourly), METAR (real-time observations)
 - **Expected Value** — skips trades where the math doesn't work
 - **Kelly Criterion** — sizes positions based on edge strength
-- **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
-- **Slippage filter** — skips markets with spread > $0.03
+- **Strategy-aware exits** — calibrated positions follow forecast invalidation/resolution; optional price stops use the executable entry bid
+- **Spread filters** — rejects both wide absolute spreads and disproportionate spreads on cheap buckets
 - **Self-calibration** — learns sigma and bias by city/source/lead-time bucket
 - **Bias correction** — applies capped forecast corrections before probability calculation
 - **Structural edge strategies** — calibrated mean, near-lock, underdispersion tails, model-lag, and gated NO-token entries
 - **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
+- **Eventual-resolution tracking** — early paper exits keep their original P&L while the market is followed to settlement for Brier scoring
 
 ### `live_executor.py` — Live Trading
 Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via `polymarket-client`. Full live trading loop with:
@@ -32,7 +33,7 @@ Connects `weatherbet.py`'s strategy engine to the Polymarket CLOB via `polymarke
 - On-chain USDC balance checks
 - Fresh market revalidation before order submission
 - Portfolio risk gates and exposure limits
-- Stop-loss, take-profit, trailing stop exits
+- Shared strategy-aware take-profit and optional spread-safe stop exits
 - Strategy-aware exits (near-lock positions hold to resolution unless invalidated by METAR)
 - Circuit breaker (stops after 5 consecutive errors)
 - Telegram notifications
@@ -60,7 +61,7 @@ The bot:
 
 Most bots use city center coordinates. That's wrong.
 
-Every Polymarket weather market resolves on a specific airport station. NYC resolves on LaGuardia (KLGA), Dallas on Love Field (KDAL) — not DFW. The difference between city center and airport can be 3–8°F. On markets with 1–2°F buckets, that's the difference between the right trade and a guaranteed loss.
+Every Polymarket weather market resolves on a specific airport station. NYC resolves on LaGuardia (KLGA), Dallas on Love Field (KDAL), and Paris on Le Bourget (LFPB). The difference between city center and airport can be 3–8°F. On markets with 1–2°F buckets, that's the difference between the right trade and a guaranteed loss.
 
 | City | Station | Airport |
 |------|---------|---------|
@@ -87,10 +88,10 @@ pip install -r requirements.txt
 pip install --pre polymarket-client
 
 # Copy and edit your secrets:
-cp .env.example .env
+cp .env.example .env.local
 ```
 
-> `.env` is in `.gitignore` — your secrets stay local. Never commit `.env`.
+> `.env` and `.env.local` are in `.gitignore` — your secrets stay local. Never commit either file.
 
 ---
 
@@ -105,11 +106,16 @@ python weatherbet.py run       # start paper trading loop
 python weatherbet.py status    # balance and open positions
 python weatherbet.py report    # full breakdown of all resolved markets
 python weatherbet.py validate  # chronological paper holdout + live-readiness gates
+python weatherbet.py archive-reset  # archive a finished cohort and reset paper bankroll/counters
+python weatherbet.py repair-calibration --dry-run  # inspect recoverable Polymarket settlements
+python weatherbet.py repair-calibration --apply    # annotate history and rebuild calibration
 ```
 
 `paper_trading.log` is plain text with ANSI color codes stripped, so it is safe to paste into reviews or inspect with `tail -f paper_trading.log`.
 
 You can also run `python weatherbet.py` with no argument; it defaults to `run`.
+
+`archive-reset` fails closed if any paper position is open. It writes a position-level snapshot under `data/evaluations/`, marks legacy trades so later settlement cannot pollute the new counters, resets the configured paper bankroll, and advances the evaluation timestamp. Forecast snapshots, actual temperatures, market history, and `data/calibration.json` are retained.
 
 ### 2. Live account status only
 
@@ -147,7 +153,7 @@ Recommended order:
 | Key | Required? | Where to get it |
 |-----|-----------|-----------------|
 | `PK` | Only for live trading | Your MetaMask / wallet's Polygon private key (see below) |
-| `VC_KEY` | No | https://www.visualcrossing.com/weather-api (free) |
+| `VC_KEY` | No; diagnostics only | https://www.visualcrossing.com/weather-api (free) |
 | `TELEGRAM_BOT_TOKEN` | No | https://t.me/BotFather |
 | `TELEGRAM_CHAT_ID` | No | Get from Telegram API (see below) |
 
@@ -174,9 +180,9 @@ MetaMask → three dots → Account details → Show private key → copy 0x...
 
 > ⚠️ This key controls your funds. Never share it, never commit it, never type it where anyone can see.
 
-### 2. `VC_KEY` — Visual Crossing (for calibration)
+### 2. `VC_KEY` — Visual Crossing (optional diagnostics)
 
-Only needed if you want the bot to fetch actual historical temperatures after markets resolve (for per-city sigma calibration).
+Optional. The paper scanner may retain Visual Crossing daily highs for comparison, but these readings never drive calibration. Calibration is derived from Polymarket's unique settled winning bucket because that is the outcome the contracts pay against.
 
 ```bash
 # 1. Sign up: https://www.visualcrossing.com/weather-api
@@ -184,7 +190,7 @@ Only needed if you want the bot to fetch actual historical temperatures after ma
 # 3. Dashboard → API Keys → copy
 ```
 
-> Without this, the bot uses default sigma values (2°F / 1.2°C). It still works — calibration just won't adapt to each city's forecast accuracy.
+> Missing `VC_KEY` does not block calibration. Open-ended winning buckets are excluded because they do not identify a precise temperature.
 
 ### 3. Telegram (for push notifications)
 
@@ -222,11 +228,16 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 | `max_bet` | 20 | Max bet per trade in USDC |
 | `min_ev` | 0.10 | Minimum expected value required |
 | `max_price` | 0.45 | Max entry price (avoid expensive YES shares) |
-| `max_slippage` | 0.03 | Max allowed ask-bid spread |
+| `max_slippage` | 0.03 | Max allowed absolute ask-bid spread |
+| `max_relative_spread` | 0.25 | Reject when spread exceeds 25% of the ask, especially on cheap buckets |
+| `min_trade_notional` | 0.50 | Operator floor; the current CLOB minimum-share cost can raise the effective minimum |
 | `kelly_fraction` | 0.25 | Fraction of Kelly to bet (0.25 = quarter-Kelly) |
 | `scan_interval` | 3600 | Seconds between full market scans |
 | `opportunity_scan_interval_seconds` | 300 | Faster structural-edge scan cadence; capped by `scan_interval` |
-| `calibration_min` | 30 | Minimum resolved samples before writing calibration |
+| `calibration_min` | 30 | Samples required for a calibration entry to be marked mature |
+| `calibration_bootstrap_min` | 7 | Begin shrinkage-regularized calibration from settled Polymarket winning buckets |
+| `calibrated_mean_min_samples` | 7 | Paper calibrated-mean bootstrap gate; aggregate city/source calibration is used until a lead bucket matures |
+| `live_calibrated_mean_min_samples` | 30 | Independent live signal maturity gate; live readiness checks still apply |
 | `max_total_exposure_pct` | 0.25 | Max total portfolio exposure as share of bankroll |
 | `max_event_exposure_pct` | 0.10 | Max same city/date exposure as share of bankroll |
 | `max_daily_loss_pct` | 0.05 | Stops new entries after daily realized loss breach |
@@ -235,13 +246,22 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 | `forecast_cache_ttl_ecmwf_seconds` | 1800 | ECMWF forecast cache TTL |
 | `forecast_cache_ttl_hrrr_seconds` | 600 | Real HRRR Conus forecast cache TTL (US only) |
 | `forecast_cache_ttl_metar_seconds` | 45 | METAR observation cache TTL |
+| `weather_api_user_agent` | `WeatherBet/1.0 weather-trading-operator` | Identifies the client to weather providers; can be overridden by `WEATHER_API_USER_AGENT` |
+| `weather_api_max_attempts` | 3 | Bounded attempts for DNS, connection, timeout, `429`, and upstream `5xx` failures |
+| `weather_api_retry_base_seconds` | 0.75 | Initial exponential-backoff delay before jitter |
+| `weather_api_retry_max_seconds` | 6.0 | Maximum delay for one weather API retry, including `Retry-After` |
 | `max_bias_correction_f` | 3.0 | Max forecast bias correction in °F |
 | `max_bias_correction_c` | 1.5 | Max forecast bias correction in °C |
 | `strategy_calibrated_mean_enabled` | true | Enable existing corrected-forecast bucket strategy |
-| `strategy_near_lock_enabled` | true | Enable D+0 near-lock only after continuous local-day METAR coverage |
+| `strategy_near_lock_enabled` | false | Enable D+0 near-lock only after continuous local-day METAR coverage |
 | `strategy_underdispersion_enabled` | false | Reserve for a future true-ensemble feed; source disagreement is not ensemble spread |
-| `strategy_model_lag_enabled` | true | Require both a forecast-probability move and insufficient bucket-specific market repricing |
+| `strategy_model_lag_enabled` | false | Require both a forecast-probability move and insufficient bucket-specific market repricing |
 | `enable_no_trades` | false | Disabled by default; when enabled, entries require the NO token's own CLOB book quote |
+| `standard_price_stop_enabled` | false | Keep calibrated weather exposure through bid noise; forecast invalidation remains active |
+| `paper_reentry_enabled` | true | Permit a new paper entry after the cooldown while preserving prior trade history |
+| `paper_reentry_cooldown_minutes` | 60 | Minimum wait before paper re-entry |
+| `paper_max_entries_per_market` | 2 | Maximum paper entries for one token market |
+| `live_reentry_enabled` | false | Live repeated entry remains fail-closed until explicitly enabled |
 | `near_lock_hours` | 18 | Hours-to-resolution window for near-lock |
 | `near_lock_min_prob` | 0.92 | Minimum near-lock probability |
 | `near_lock_max_price` | 0.82 | Strategy-specific max entry price for near-lock |
@@ -268,8 +288,8 @@ TELEGRAM_CHAT_ID=       # your Telegram user/group ID
 pip install -r requirements.txt
 
 # 2. Set up environment file
-cp .env.example .env
-# For paper trading, VC_KEY is optional and PK can stay empty.
+cp .env.example .env.local
+# Paper trading requires no wallet key; VC_KEY is optional diagnostic data.
 # For live trading, set PK and optional WALLET/Telegram values.
 
 # 3. Verify imports
@@ -299,9 +319,15 @@ All data is saved to `data/markets/` — one JSON file per market. Each file con
 - Market price history
 - Position details (strategy, YES/NO side, entry, stop, PnL, raw/corrected forecast, bias, raw/corrected EV)
 - Structural-edge diagnostics (fair price, edge, observed high, remaining max, dispersion ratio, source spread, model-lag shift)
+- Exchange sizing evidence (`min_order_size`, required/proposed notional, sizing decision)
+- Diagnostic shadow signals for otherwise valid opportunities rejected only by sizing
 - Final resolution outcome
 
-Calibration is saved to `data/calibration.json`. The bot writes aggregate sigma entries and city/source/lead-bucket entries containing bias, raw bias, sigma, and sample count. Live signal generation uses the corrected forecast before probability calculation.
+Calibration is saved to `data/calibration.json`. Only validated Polymarket winning buckets contribute observations: exact buckets use their value, bounded ranges use their midpoint, and open-ended tails are skipped. Raw third-party temperatures remain separate audit fields. The bot writes aggregate sigma entries and city/source/lead-bucket entries containing bias, raw bias, sigma, and sample count.
+
+Before restarting after upgrading an existing dataset, run the repair command in dry-run mode, review its counts, and then apply it. Apply mode archives the prior calibration file and writes a repair audit under `data/evaluations/`. Shadow metrics appear in `status`, `report`, and `validate`, but never count as trades, ROI, drawdown, or promotion evidence.
+
+Archived paper cohorts are saved under `data/evaluations/`. These archives preserve legacy state and position records for audit purposes without allowing old results to count toward the current promotion cohort.
 
 ---
 
@@ -313,7 +339,14 @@ Calibration is saved to `data/calibration.json`. The bot writes aggregate sigma 
 | Aviation Weather (METAR) | None | Real-time station observations |
 | Polymarket Gamma | None | Market data |
 | Polymarket CLOB | Wallet signature | Order placement (live trading only) |
-| Visual Crossing | Free key | Historical temps for calibration |
+| Visual Crossing | Free key | Optional historical-temperature diagnostics |
+
+Weather provider calls fail closed: an unavailable or malformed response cannot
+become a forecast or a trade signal. Open-Meteo and Aviation Weather requests use
+bounded exponential backoff with jitter. HTTP `204` is treated as no observation,
+`429` honors a bounded `Retry-After`, and retryable `5xx` responses are retried.
+METAR observations for every configured station are fetched in one request and
+cached briefly, avoiding a burst of one request per city.
 
 ---
 

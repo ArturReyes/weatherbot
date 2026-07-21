@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import ceil
 
+from paper_trading import market_positions
+
 
 @dataclass(frozen=True)
 class PromotionPolicy:
@@ -15,6 +17,7 @@ class PromotionPolicy:
     min_realized_roi: float = 0.0
     max_brier_score: float = 0.25
     max_drawdown_pct: float = 0.10
+    evaluation_started_at: str | None = None
 
     @classmethod
     def from_mapping(cls, config: dict) -> "PromotionPolicy":
@@ -25,12 +28,14 @@ class PromotionPolicy:
             min_realized_roi=float(config.get("promotion_min_realized_roi", 0.0)),
             max_brier_score=float(config.get("promotion_max_brier_score", 0.25)),
             max_drawdown_pct=float(config.get("promotion_max_drawdown_pct", 0.10)),
+            evaluation_started_at=config.get("evaluation_started_at"),
         )
 
 
 @dataclass(frozen=True)
 class TradeObservation:
     strategy: str
+    opened_at: datetime | None
     closed_at: datetime
     pnl: float
     cost: float
@@ -70,6 +75,43 @@ class OutOfSampleReport:
     holdout: dict[str, StrategyMetrics]
     decision: PromotionDecision
     holdout_fraction: float
+    evaluation_started_at: str | None
+
+
+@dataclass(frozen=True)
+class ShadowMetrics:
+    strategy: str
+    signals: int
+    resolved: int
+    wins: int
+    brier_score: float | None
+
+
+def shadow_diagnostics(markets: list[dict]) -> dict[str, ShadowMetrics]:
+    """Evaluate non-traded signals separately from promotion evidence."""
+    grouped: dict[str, list[dict]] = {}
+    for market in markets:
+        for signal in market.get("shadow_signals", []):
+            strategy = str(signal.get("strategy", "calibrated_mean"))
+            grouped.setdefault(strategy, []).append(signal)
+    result = {}
+    for strategy, signals in sorted(grouped.items()):
+        resolved = [signal for signal in signals if signal.get("eventual_outcome") in {"win", "loss"}]
+        scored = []
+        for signal in resolved:
+            probability = _number(signal.get("probability"))
+            if probability is None:
+                continue
+            outcome = 1 if signal["eventual_outcome"] == "win" else 0
+            scored.append((probability - outcome) ** 2)
+        result[strategy] = ShadowMetrics(
+            strategy=strategy,
+            signals=len(signals),
+            resolved=len(resolved),
+            wins=sum(signal.get("eventual_outcome") == "win" for signal in resolved),
+            brier_score=round(sum(scored) / len(scored), 6) if scored else None,
+        )
+    return result
 
 
 def chronological_out_of_sample_report(
@@ -85,11 +127,19 @@ def chronological_out_of_sample_report(
     full-market backtest: it reports the bot's actual, timestamped paper
     decisions and never lets a later resolution influence an earlier entry.
     """
-    observations = sorted(_trade_observations(markets), key=lambda item: item.closed_at)
+    observations = _trade_observations(markets)
+    evaluation_start = _timestamp(policy.evaluation_started_at)
+    if evaluation_start is not None:
+        observations = [
+            observation
+            for observation in observations
+            if observation.opened_at is not None and observation.opened_at >= evaluation_start
+        ]
+    observations.sort(key=lambda item: item.closed_at)
     if not observations:
         reasons = tuple(f"{strategy}: no closed paper positions" for strategy in required_strategies)
         decision = PromotionDecision(False, reasons or ("no closed paper positions",))
-        return OutOfSampleReport({}, {}, decision, policy.holdout_fraction)
+        return OutOfSampleReport({}, {}, decision, policy.holdout_fraction, policy.evaluation_started_at)
 
     holdout_count = max(1, ceil(len(observations) * policy.holdout_fraction))
     if holdout_count >= len(observations):
@@ -106,34 +156,36 @@ def chronological_out_of_sample_report(
         holdout=holdout,
         decision=_promotion_decision(holdout, policy, required_strategies),
         holdout_fraction=policy.holdout_fraction,
+        evaluation_started_at=policy.evaluation_started_at,
     )
 
 
 def _trade_observations(markets: list[dict]) -> list[TradeObservation]:
     observations: list[TradeObservation] = []
     for market in markets:
-        position = market.get("position") or {}
-        if position.get("status") != "closed" or position.get("pnl") is None:
-            continue
-        closed_at = _timestamp(position.get("closed_at") or market.get("closed_at"))
-        if closed_at is None:
-            continue
-        probability = _number(position.get("p", position.get("probability")))
-        resolved_outcome = _resolved_outcome(market)
-        observations.append(
-            TradeObservation(
-                strategy=str(position.get("strategy", "calibrated_mean")),
-                closed_at=closed_at,
-                pnl=float(position["pnl"]),
-                cost=max(0.0, float(position.get("cost", position.get("amount", 0.0)))),
-                probability=probability,
-                resolved_outcome=resolved_outcome,
-                expected_ev=_number(position.get("ev")),
-                exit_price=_number(position.get("exit_price")),
-                entry_price=_number(position.get("entry_price")),
-                close_reason=position.get("close_reason"),
+        for position in market_positions(market):
+            if position.get("status") != "closed" or position.get("pnl") is None:
+                continue
+            closed_at = _timestamp(position.get("closed_at") or market.get("closed_at"))
+            if closed_at is None:
+                continue
+            probability = _number(position.get("p", position.get("probability")))
+            resolved_outcome = _resolved_outcome(market, position)
+            observations.append(
+                TradeObservation(
+                    strategy=str(position.get("strategy", "calibrated_mean")),
+                    opened_at=_timestamp(position.get("opened_at") or position.get("entered_at")),
+                    closed_at=closed_at,
+                    pnl=float(position["pnl"]),
+                    cost=max(0.0, float(position.get("cost", position.get("amount", 0.0)))),
+                    probability=probability,
+                    resolved_outcome=resolved_outcome,
+                    expected_ev=_number(position.get("ev")),
+                    exit_price=_number(position.get("exit_price")),
+                    entry_price=_number(position.get("entry_price")),
+                    close_reason=position.get("close_reason"),
+                )
             )
-        )
     return observations
 
 
@@ -220,8 +272,10 @@ def _max_drawdown_pct(observations: list[TradeObservation], bankroll: float) -> 
     return maximum
 
 
-def _resolved_outcome(market: dict) -> int | None:
-    outcome = market.get("resolved_outcome")
+def _resolved_outcome(market: dict, position: dict) -> int | None:
+    if market.get("resolved") is not True and market.get("status") != "resolved":
+        return None
+    outcome = position.get("eventual_outcome", market.get("resolved_outcome"))
     if outcome == "win":
         return 1
     if outcome == "loss":

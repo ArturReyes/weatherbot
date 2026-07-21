@@ -35,9 +35,17 @@ class MarketDateTests(unittest.TestCase):
     def test_extracts_named_month_date_from_real_gamma_slug(self) -> None:
         self.assertEqual(
             extract_market_date(
-                "highest-temperature-in-tel-aviv-on-april-7-2026-21c"
+                "highest-temperature-in-paris-on-april-7-2026-21c"
             ),
             "2026-04-07",
+        )
+
+    def test_fahrenheit_range_suffix_falls_back_to_named_market_date(self) -> None:
+        self.assertEqual(
+            extract_market_date(
+                "highest-temperature-in-nyc-on-july-21-2026-72-73f"
+            ),
+            "2026-07-21",
         )
 
 
@@ -52,6 +60,51 @@ class ContractValidationTests(unittest.TestCase):
         )
 
         self.assertTrue(result.valid, result.reason)
+        self.assertEqual(result.contract.provider, "noaa")
+
+    def test_accepts_matching_wunderground_contract(self) -> None:
+        market = valid_market()
+        market["description"] = (
+            "This market resolves to the highest temperature recorded in degrees "
+            "Fahrenheit on 9 Jul '26 at station KLGA. Resolution source: "
+            "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA"
+        )
+
+        result = contract_matches_strategy(
+            market,
+            city_name="New York City",
+            station="KLGA",
+            unit="F",
+            date_str="2026-07-09",
+        )
+
+        self.assertTrue(result.valid, result.reason)
+        self.assertEqual(result.contract.provider, "wunderground")
+
+    def test_accepts_current_paris_le_bourget_contract(self) -> None:
+        market = {
+            "question": "Will the highest temperature in Paris be 25°C on July 21?",
+            "slug": "highest-temperature-in-paris-on-july-21-2026-25c",
+            "description": (
+                "This market resolves to the highest temperature recorded at the "
+                "Paris-Le Bourget Airport Station in degrees Celsius on 21 Jul '26. "
+                "The resolution source is Wunderground, specifically the highest temperature: "
+                "https://www.wunderground.com/history/daily/fr/bonneuil-en-france/LFPB."
+            ),
+            "acceptingOrders": True,
+            "enableOrderBook": True,
+        }
+
+        result = contract_matches_strategy(
+            market,
+            city_name="Paris",
+            station="LFPB",
+            unit="C",
+            date_str="2026-07-21",
+        )
+
+        self.assertTrue(result.valid, result.reason)
+        self.assertEqual(result.contract.station, "LFPB")
 
     def test_rejects_non_high_temperature_contract(self) -> None:
         market = valid_market()

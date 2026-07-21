@@ -15,6 +15,8 @@ CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 class ExecutableQuote:
     bid: float
     ask: float
+    min_order_size: float
+    tick_size: float
 
 
 def fetch_executable_quote(
@@ -34,8 +36,15 @@ def fetch_executable_quote(
         data = response.json()
         bids = [float(level["price"]) for level in data.get("bids", []) if level.get("price") is not None]
         asks = [float(level["price"]) for level in data.get("asks", []) if level.get("price") is not None]
+        min_order_size = float(data["min_order_size"])
+        tick_size = float(data["tick_size"])
     except (AttributeError, KeyError, TypeError, ValueError, requests.RequestException):
         return None
-    if not bids or not asks:
+    if not bids or not asks or min_order_size <= 0 or tick_size <= 0:
         return None
-    return ExecutableQuote(bid=max(bids), ask=min(asks))
+    return ExecutableQuote(
+        bid=max(bids),
+        ask=min(asks),
+        min_order_size=min_order_size,
+        tick_size=tick_size,
+    )

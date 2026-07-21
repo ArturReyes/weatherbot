@@ -23,7 +23,7 @@ class WeatherSourceTests(unittest.TestCase):
 
         url = request.call_args.args[0]
         self.assertIn("/v1/gfs?", url)
-        self.assertIn("models=hrrr_conus", url)
+        self.assertIn("models=ncep_hrrr_conus", url)
         self.assertEqual(result, {"2026-07-10": 81})
 
     def test_hrrr_is_not_requested_for_non_us_city(self) -> None:

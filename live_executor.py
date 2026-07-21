@@ -87,6 +87,7 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 import weatherbet  # noqa: E402
 from observations import daily_observed_high  # noqa: E402
 from executable_quotes import fetch_executable_quote  # noqa: E402
+from order_eligibility import evaluate_order_eligibility  # noqa: E402
 from live_trading import (  # noqa: E402
     PolymarketGateway,
     ProcessLock,
@@ -110,7 +111,10 @@ from strategy import (  # noqa: E402
     BucketQuote,
     ForecastContext,
     StrategyConfig,
+    calibration_gate_reason,
+    evaluate_price_exit,
     generate_strategy_candidates,
+    initial_standard_stop_price,
     source_spread_from_values,
 )
 
@@ -134,6 +138,7 @@ forecast_calibration = weatherbet.forecast_calibration
 # CONFIG
 # =============================================================================
 
+load_dotenv(".env.local")
 load_dotenv()
 
 PRIVATE_KEY = os.environ.get("PK", "")
@@ -157,6 +162,7 @@ MIN_HOURS = float(_cfg.get("min_hours", 2.0))
 MAX_HOURS = float(_cfg.get("max_hours", 72.0))
 KELLY_FRACTION = float(_cfg.get("kelly_fraction", 0.25))
 MAX_SLIPPAGE = float(_cfg.get("max_slippage", 0.03))
+MIN_TRADE_NOTIONAL = float(_cfg.get("min_trade_notional", 0.50))
 SCAN_INTERVAL = int(_cfg.get("scan_interval", 1800))
 OPPORTUNITY_SCAN_INTERVAL = int(_cfg.get("opportunity_scan_interval_seconds", 300))
 ACTIVE_SCAN_INTERVAL = min(SCAN_INTERVAL, OPPORTUNITY_SCAN_INTERVAL)
@@ -165,11 +171,16 @@ FORECAST_CACHE_TTLS = {
     "hrrr": float(_cfg.get("forecast_cache_ttl_hrrr_seconds", 600)),
     "metar": float(_cfg.get("forecast_cache_ttl_metar_seconds", 45)),
 }
-STRATEGY_CONFIG = StrategyConfig.from_mapping(
-    _cfg,
-    min_ev=MIN_EV,
-    max_price=MAX_PRICE,
-    max_slippage=MAX_SLIPPAGE,
+STRATEGY_CONFIG = replace(
+    StrategyConfig.from_mapping(
+        _cfg,
+        min_ev=MIN_EV,
+        max_price=MAX_PRICE,
+        max_slippage=MAX_SLIPPAGE,
+    ),
+    calibrated_mean_min_samples=int(
+        _cfg.get("live_calibrated_mean_min_samples", _cfg.get("calibration_min", 30))
+    ),
 )
 RISK_LIMITS = RiskLimits(
     max_total_exposure_pct=float(_cfg.get("max_total_exposure_pct", 0.25)),
@@ -179,6 +190,9 @@ RISK_LIMITS = RiskLimits(
     max_signal_age_seconds=float(_cfg.get("max_signal_age_seconds", 120)),
 )
 REQUIRE_VALIDATION_FOR_LIVE = bool(_cfg.get("require_validation_for_live", True))
+LIVE_REENTRY_ENABLED = bool(_cfg.get("live_reentry_enabled", False))
+LIVE_REENTRY_COOLDOWN_MINUTES = float(_cfg.get("live_reentry_cooldown_minutes", 60))
+LIVE_MAX_ENTRIES_PER_MARKET = int(_cfg.get("live_max_entries_per_market", 2))
 
 DATA_DIR = Path("data")
 LIVE_STATE_FILE = DATA_DIR / "live_state.json"
@@ -462,6 +476,10 @@ class TradeSignal:
     shares: float
     forecast_source: str
     sigma: float
+    min_order_size: float = 0.0
+    required_notional: float = 0.0
+    proposed_notional: float = 0.0
+    tick_size: float = 0.0
     fee_rate: float = 0.0
     outcome_side: str = YES
     strategy: str = "calibrated_mean"
@@ -481,6 +499,7 @@ class TradeSignal:
     forecast_raw_bias: float = 0.0
     forecast_lead_bucket: str | None = None
     forecast_calibration_n: int = 0
+    forecast_calibration_scope: str = "none"
     raw_probability: float | None = None
     raw_ev: float | None = None
     reason: str = ""
@@ -554,6 +573,36 @@ def hours_to_resolution(end_date_iso: str) -> float:
         return max(0.0, (end - datetime.now(timezone.utc)).total_seconds() / 3600)
     except (ValueError, AttributeError):
         return 999.0
+
+
+def live_reentry_reason(state: dict, *, token_id: str, now: datetime) -> str | None:
+    """Fail closed on repeated live entry unless explicitly enabled and cooled down."""
+    prior = [
+        position
+        for position in state.get("positions", [])
+        if position.get("token_id") == token_id and position.get("status") != "rejected"
+    ]
+    if not prior:
+        return None
+    if not LIVE_REENTRY_ENABLED:
+        return "live re-entry disabled"
+    if len(prior) >= max(1, LIVE_MAX_ENTRIES_PER_MARKET):
+        return "live re-entry limit"
+    latest = max(
+        prior,
+        key=lambda position: str(position.get("exited_at") or position.get("closed_at") or ""),
+    )
+    raw_closed_at = latest.get("exited_at") or latest.get("closed_at")
+    try:
+        closed_at = datetime.fromisoformat(str(raw_closed_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return "live re-entry missing close time"
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    elapsed_minutes = (now.astimezone(timezone.utc) - closed_at.astimezone(timezone.utc)).total_seconds() / 60.0
+    if elapsed_minutes < max(0.0, LIVE_REENTRY_COOLDOWN_MINUTES):
+        return "live re-entry cooldown"
+    return None
 
 
 def generate_signals(
@@ -703,13 +752,18 @@ def generate_signals(
                 hours_to_resolution_value=hrs,
             )
 
-            if not sources:
-                continue  # no forecast available
+            forecast_sources = [
+                (source, value)
+                for source, value in sources
+                if source in {"hrrr_conus", "ecmwf"}
+            ]
+            if not forecast_sources:
+                continue  # METAR is observation-only, never a daily-high forecast
 
-            # Prefer HRRR for near-term US, then ECMWF, then METAR
-            priority = {"hrrr_conus": 0, "ecmwf": 1, "metar": 2}
-            sources.sort(key=lambda x: priority.get(x[0], 99))
-            best_source, raw_forecast_temp = sources[0]
+            # Prefer HRRR for near-term US, then ECMWF. METAR stays observational.
+            priority = {"hrrr_conus": 0, "ecmwf": 1}
+            forecast_sources.sort(key=lambda x: priority.get(x[0], 99))
+            best_source, raw_forecast_temp = forecast_sources[0]
             calibration = forecast_calibration(
                 city_slug,
                 best_source,
@@ -750,12 +804,13 @@ def generate_signals(
                 observed_high_so_far=observed_high,
                 observed_high_complete=observed.complete,
                 forecast_remaining_max=remaining_max,
-                source_spread=source_spread_from_values([value for _, value in sources]),
+                source_spread=source_spread_from_values([value for _, value in forecast_sources]),
                 ensemble_spread=None,
                 forecast_bias=float(calibration["forecast_bias"]),
                 forecast_raw_bias=float(calibration["forecast_raw_bias"]),
                 forecast_lead_bucket=calibration["forecast_lead_bucket"],
                 forecast_calibration_n=int(calibration["forecast_calibration_n"]),
+                forecast_calibration_scope=str(calibration["forecast_calibration_scope"]),
             )
             history[history_key] = {
                 "corrected_forecast_temp": float(forecast_temp),
@@ -772,19 +827,59 @@ def generate_signals(
                 config=STRATEGY_CONFIG,
             )
             if not candidates:
+                gate_reason = calibration_gate_reason(context, STRATEGY_CONFIG)
+                if gate_reason is not None:
+                    logger.debug("Skipped %s: %s", mid, gate_reason)
                 continue
             candidate = candidates[0]
             if not candidate.token_id or candidate.token_id in existing_tokens:
                 continue
+            reentry_block = live_reentry_reason(
+                state,
+                token_id=candidate.token_id,
+                now=datetime.now(timezone.utc),
+            )
+            if reentry_block is not None:
+                logger.info("Skipped %s: %s", candidate.token_id, reentry_block)
+                continue
 
-            kelly_frac = calc_kelly(candidate.probability, candidate.entry_price, fee_rate)
+            executable_quote = fetch_executable_quote(candidate.token_id)
+            if executable_quote is None:
+                logger.info("Skipped %s: executable book metadata unavailable", candidate.token_id)
+                continue
+            entry_price = executable_quote.ask
+            spread = entry_price - executable_quote.bid
+            relative_spread = spread / entry_price if entry_price > 0 else float("inf")
+            if (
+                entry_price >= weatherbet.max_price_for_candidate(candidate)
+                or spread > MAX_SLIPPAGE
+                or relative_spread > STRATEGY_CONFIG.max_relative_spread
+            ):
+                continue
+            ev = calc_ev(candidate.probability, entry_price, fee_rate)
+            if ev < (STRATEGY_CONFIG.no_trade_min_ev if candidate.side == NO else STRATEGY_CONFIG.min_ev):
+                continue
+            kelly_frac = calc_kelly(candidate.probability, entry_price, fee_rate)
             balance = Decimal(str(state.get("balance_ref", 10000.0)))
             raw_size = bet_size(kelly_frac, float(balance)) * candidate.size_multiplier
             size_usdc = min(raw_size, MAX_BET)
-            shares = round(size_usdc / candidate.entry_price, 2)
-
-            if shares <= 0 or size_usdc <= 0:
+            eligibility = evaluate_order_eligibility(
+                proposed_notional=size_usdc,
+                entry_price=entry_price,
+                fee_rate=fee_rate,
+                min_order_size=executable_quote.min_order_size,
+                min_trade_notional=MIN_TRADE_NOTIONAL,
+            )
+            if not eligibility.allowed:
+                logger.info(
+                    "Skipped %s: %s proposed=%.4f required=%s",
+                    candidate.token_id,
+                    eligibility.reason,
+                    eligibility.proposed_notional,
+                    eligibility.required_notional,
+                )
                 continue
+            shares = round(eligibility.shares, 4)
 
             # ── Build signal ─────────────────────────────────────
             signal = TradeSignal(
@@ -800,12 +895,16 @@ def generate_signals(
                 bucket_high=candidate.bucket_high,
                 unit=unit_sym,
                 probability=candidate.probability,
-                entry_price=candidate.entry_price,
-                spread=candidate.spread,
-                ev=candidate.ev,
+                entry_price=entry_price,
+                spread=spread,
+                ev=ev,
                 kelly=kelly_frac,
                 size_usdc=size_usdc,
                 shares=shares,
+                min_order_size=executable_quote.min_order_size,
+                required_notional=float(eligibility.required_notional),
+                proposed_notional=eligibility.proposed_notional,
+                tick_size=executable_quote.tick_size,
                 forecast_source=best_source,
                 sigma=sigma,
                 fee_rate=fee_rate,
@@ -827,9 +926,14 @@ def generate_signals(
                 forecast_raw_bias=float(calibration["forecast_raw_bias"]),
                 forecast_lead_bucket=calibration["forecast_lead_bucket"],
                 forecast_calibration_n=int(calibration["forecast_calibration_n"]),
+                forecast_calibration_scope=str(calibration["forecast_calibration_scope"]),
                 raw_probability=candidate.raw_probability,
-                raw_ev=candidate.raw_ev,
-                reason=f"{candidate.strategy} {candidate.side} EV {candidate.ev:+.2f} @ ${candidate.entry_price:.3f}",
+                raw_ev=(
+                    calc_ev(candidate.raw_probability, entry_price, fee_rate)
+                    if candidate.raw_probability is not None
+                    else candidate.raw_ev
+                ),
+                reason=f"{candidate.strategy} {candidate.side} EV {ev:+.2f} @ ${entry_price:.3f}",
             )
             signals.append(signal)
 
@@ -914,22 +1018,19 @@ def refresh_signal_with_live_market(
         )
         return None
 
-    if signal.outcome_side == NO:
-        executable_no_quote = fetch_executable_quote(signal.token_id)
-        quote = (
-            (executable_no_quote.bid, executable_no_quote.ask)
-            if executable_no_quote is not None
-            else None
-        )
-    else:
-        quote = _token_quote_from_market(market, signal.token_id)
-    if quote is None:
+    executable_quote = fetch_executable_quote(signal.token_id)
+    if executable_quote is None:
         logger.warning("Live revalidation found no quote for %s", signal.token_id)
         return None
 
-    bid, ask = quote
+    bid, ask = executable_quote.bid, executable_quote.ask
     spread = ask - bid
-    if ask >= _max_price_for_signal(signal) or spread > MAX_SLIPPAGE:
+    relative_spread = spread / ask if ask > 0 else float("inf")
+    if (
+        ask >= _max_price_for_signal(signal)
+        or spread > MAX_SLIPPAGE
+        or relative_spread > STRATEGY_CONFIG.max_relative_spread
+    ):
         logger.info(
             "Live revalidation skipped %s: ask=%.4f spread=%.4f",
             signal.token_id,
@@ -951,9 +1052,23 @@ def refresh_signal_with_live_market(
 
     kelly_frac = calc_kelly(signal.probability, ask, fee_rate)
     size_usdc = min(bet_size(kelly_frac, balance_ref) * signal.size_multiplier, MAX_BET)
-    shares = round(size_usdc / ask, 2)
-    if shares <= 0 or size_usdc <= 0:
+    eligibility = evaluate_order_eligibility(
+        proposed_notional=size_usdc,
+        entry_price=ask,
+        fee_rate=fee_rate,
+        min_order_size=executable_quote.min_order_size,
+        min_trade_notional=MIN_TRADE_NOTIONAL,
+    )
+    if not eligibility.allowed:
+        logger.info(
+            "Live revalidation skipped %s: %s proposed=%.4f required=%s",
+            signal.token_id,
+            eligibility.reason,
+            eligibility.proposed_notional,
+            eligibility.required_notional,
+        )
         return None
+    shares = round(eligibility.shares, 4)
 
     raw_ev = (
         calc_ev(signal.raw_probability, ask, fee_rate)
@@ -968,6 +1083,10 @@ def refresh_signal_with_live_market(
         kelly=kelly_frac,
         size_usdc=size_usdc,
         shares=shares,
+        min_order_size=executable_quote.min_order_size,
+        required_notional=float(eligibility.required_notional),
+        proposed_notional=eligibility.proposed_notional,
+        tick_size=executable_quote.tick_size,
         fee_rate=fee_rate,
         raw_ev=raw_ev,
         reason=f"EV {ev:+.2f} @ ${ask:.3f}",
@@ -1337,6 +1456,7 @@ class LiveExecutor:
             "forecast_raw_bias": signal.forecast_raw_bias,
             "forecast_lead_bucket": signal.forecast_lead_bucket,
             "forecast_calibration_n": signal.forecast_calibration_n,
+            "forecast_calibration_scope": signal.forecast_calibration_scope,
             "forecast_source": signal.forecast_source,
             "sigma": signal.sigma,
             "fee_rate": signal.fee_rate,
@@ -1356,6 +1476,11 @@ class LiveExecutor:
             "ev": signal.ev,
             "raw_ev": signal.raw_ev,
             "requested_amount": signal.size_usdc,
+            "proposed_notional": signal.proposed_notional,
+            "required_notional": signal.required_notional,
+            "min_order_size": signal.min_order_size,
+            "tick_size": signal.tick_size,
+            "sizing_decision": "accepted",
             "amount": 0.0,
             "shares": 0.0,
             "entry_price": signal.entry_price,
@@ -1363,7 +1488,11 @@ class LiveExecutor:
             "spread": signal.spread,
             "signal_created_at": signal.created_at_ts,
             "status": "submitting",
-            "stop_price": round(signal.entry_price * 0.80, 4),
+            "stop_reference_price": round(max(0.0, signal.entry_price - signal.spread), 4),
+            "stop_price": initial_standard_stop_price(
+                entry_bid=max(0.0, signal.entry_price - signal.spread),
+                config=STRATEGY_CONFIG,
+            ),
             "trailing_activated": False,
             "entered_at": datetime.now(timezone.utc).isoformat(),
             "exited_at": None,
@@ -1463,8 +1592,6 @@ class LiveExecutor:
                 )
 
                 entry = float(pos["entry_price"])
-                stop = float(pos.get("stop_price", entry * 0.80))
-
                 # Hours to resolution
                 end_dt = detail.get("endDate", "")
                 hrs_left = hours_to_resolution(end_dt)
@@ -1481,36 +1608,26 @@ class LiveExecutor:
                             closed += 1
                     continue
 
-                # ── Trailing stop logic ─────────────────────────
-                if not pos.get("trailing_activated") and current_price >= entry * 1.20:
-                    pos["stop_price"] = round(entry, 4)
-                    pos["trailing_activated"] = True
+                decision = evaluate_price_exit(
+                    entry_price=entry,
+                    current_price=current_price,
+                    hours_left=hrs_left,
+                    exit_policy=pos.get("exit_policy", "standard"),
+                    stop_price=pos.get("stop_price"),
+                    trailing_activated=bool(pos.get("trailing_activated", False)),
+                    config=STRATEGY_CONFIG,
+                )
+                if decision.trailing_activated and not pos.get("trailing_activated"):
                     logger.info(
                         "🔒 Trailing: %s %s — stop moved to breakeven $%.3f",
                         pos["city_name"],
                         pos["date"],
                         entry,
                     )
-
-                # ── Take-profit threshold ───────────────────────
-                if hrs_left < 24:
-                    take_profit_price = None  # hold to resolution
-                elif hrs_left < 48:
-                    take_profit_price = 0.85
-                else:
-                    take_profit_price = 0.75
-
-                # ── Exit conditions ─────────────────────────────
-                if take_profit_price is not None and current_price >= take_profit_price:
-                    if self._exit_position(pos, current_price, "take_profit"):
-                        closed += 1
-                elif current_price <= stop:
-                    if current_price < entry:
-                        did_close = self._exit_position(pos, current_price, "stop_loss")
-                    else:
-                        did_close = self._exit_position(pos, current_price, "trailing_stop")
-                    if did_close:
-                        closed += 1
+                pos["stop_price"] = decision.stop_price
+                pos["trailing_activated"] = decision.trailing_activated
+                if decision.reason and self._exit_position(pos, current_price, decision.reason):
+                    closed += 1
 
             except Exception as e:
                 logger.debug(
